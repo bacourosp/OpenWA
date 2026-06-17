@@ -4,7 +4,7 @@ import { config, assertConfig } from './config.js';
 import { generateReply } from './agent.js';
 import { sendText, ensureSessionStarted } from './openwa.js';
 import { startSchedulers } from './scheduler.js';
-import { runNasdaqReport } from './nasdaq.js';
+import { runNasdaqAnalysis } from './jobs/nasdaq-analysis.js';
 
 assertConfig();
 
@@ -63,7 +63,7 @@ app.post('/admin/nasdaq-report', async (req, res) => {
   }
   const to = Array.isArray(req.body?.to) && req.body.to.length ? (req.body.to as string[]) : undefined;
   try {
-    const result = await runNasdaqReport(to);
+    const result = await runNasdaqAnalysis(to);
     res.json({ ok: true, sent: result.sent, preview: result.text.slice(0, 500) });
   } catch (err) {
     console.error('[admin] nasdaq-report error:', err);

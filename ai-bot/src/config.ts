@@ -12,6 +12,13 @@ function list(name: string): string[] {
     .filter(Boolean);
 }
 
+function parseTimeBlock(val: string): { startHour: number; startMin: number; windowMin: number } {
+  const [start, end] = val.split('-');
+  const [sh, sm] = start.split(':').map(Number);
+  const [eh, em] = end.split(':').map(Number);
+  return { startHour: sh, startMin: sm, windowMin: eh * 60 + em - (sh * 60 + sm) };
+}
+
 /**
  * All runtime configuration for the bot. Nothing here is OpenWA-specific code —
  * it only needs the gateway's base URL + (optional in dev) API key, the session id,
@@ -59,11 +66,21 @@ export const config = {
   ragTopK: Number(env('RAG_TOP_K', '6')),
   ragMaxChars: Number(env('RAG_MAX_CHARS', '120000')),
 
-  // Daily NASDAQ fundamental report (scheduled automation).
-  dailyReportChats: list('DAILY_REPORT_CHATS'),
-  dailyReportCron: env('DAILY_REPORT_CRON', '0 7 * * 1-5'),
-  dailyReportTz: env('DAILY_REPORT_TZ', 'America/New_York'),
-  // Token to protect the admin endpoints (manual report trigger). Empty = allow in dev.
+  // Scheduler mode: test = every 5 min to TEST_GROUP_ID; production = time blocks to PRODUCTION_GROUPS.
+  testMode: env('TEST_MODE', 'false') === 'true',
+  testGroupId: env('TEST_GROUP_ID'),
+  productionGroups: list('PRODUCTION_GROUPS'),
+  schedulerTz: env('SCHEDULER_TZ', 'America/New_York'),
+
+  // Job time blocks (HH:MM-HH:MM) + cron day expression (e.g. "1,3,5" or "1-5").
+  nasdaqAnalysisBlock: parseTimeBlock(env('NASDAQ_ANALYSIS_BLOCK', '08:00-09:30')),
+  nasdaqAnalysisDays: env('NASDAQ_ANALYSIS_DAYS', '1,3,5'),
+  tradingTipsBlock: parseTimeBlock(env('TRADING_TIPS_BLOCK', '09:30-10:30')),
+  tradingTipsDays: env('TRADING_TIPS_DAYS', '2,4'),
+  newsShareBlock: parseTimeBlock(env('NEWS_SHARE_BLOCK', '15:00-16:30')),
+  newsShareDays: env('NEWS_SHARE_DAYS', '1-5'),
+
+  // Token to protect the admin endpoints (manual trigger). Empty = open in dev.
   adminToken: env('ADMIN_TOKEN'),
 
   // Guardrails.
@@ -80,9 +97,14 @@ export function assertConfig(): void {
     throw new Error(`Missing required env: ${missing.join(', ')}`);
   }
   if (config.allowedChats.size === 0 && !config.replyToDirect) {
+    console.warn('[config] ALLOWED_CHATS vacío y REPLY_TO_DIRECT=false → el bot no responderá mensajes entrantes.');
+  }
+  const targets = config.testMode ? [config.testGroupId].filter(Boolean) : config.productionGroups;
+  if (targets.length === 0) {
     console.warn(
-      '[config] ALLOWED_CHATS is empty and REPLY_TO_DIRECT=false → the bot will not reply to anything. ' +
-        'Add group ids to ALLOWED_CHATS.',
+      config.testMode
+        ? '[config] TEST_MODE=true pero TEST_GROUP_ID está vacío → los jobs no enviarán mensajes.'
+        : '[config] PRODUCTION_GROUPS vacío → los jobs programados no enviarán mensajes. Configura PRODUCTION_GROUPS o activa TEST_MODE.',
     );
   }
 }

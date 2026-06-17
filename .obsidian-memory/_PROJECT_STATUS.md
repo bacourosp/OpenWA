@@ -75,3 +75,14 @@ PORT=2785
 DASHBOARD_PORT=2886
 DATABASE_TYPE=sqlite (default)
 ```
+
+## Git remotes
+
+| Remote | URL | Rol |
+|---|---|---|
+| `origin` | `https://github.com/rmyndharis/OpenWA.git` | Upstream (solo fetch) |
+| `fork` | `https://github.com/bacourosp/OpenWA.git` | Fork propio (push aquí) |
+
+- GitHub autenticado como **`bacourosp`**
+- Para hacer push siempre usar: `git push fork main`
+- Para traer cambios del upstream: `git pull origin main` (luego resolver conflictos y `git push fork main`)

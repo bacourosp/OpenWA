@@ -5,6 +5,70 @@
 
 ---
 
+## 2026-06-17 — Rediseño ai-bot: broadcaster programado con 3 jobs
+
+**Qué se hizo:**
+- REPLY_TO_DIRECT deshabilitado (false)
+- Bot rediseñado de chatbot reactivo a broadcaster proactivo con 3 jobs programados
+- Nuevo job `nasdaq-analysis.ts` — análisis fundamental NAS100 (Lun/Mié/Vie mañana)
+- Nuevo job `trading-tips.ts` — tips de trading con rotación anti-repetición (Mar/Jue)
+- Nuevo job `news-share.ts` — noticias/citas de figuras públicas en español (diario tarde)
+- `voice.ts` — constante PABLO_VOICE compartida (tono casual, humanizado, parafaseado)
+- `scheduler.ts` — rediseñado: bloques horarios + offset aleatorio dentro de la ventana
+- TEST_MODE=true activado en .env → jobs cada 5 min al grupo de prueba (escalonados 90s)
+- `config.ts` — nuevas vars: TEST_MODE, TEST_GROUP_ID, PRODUCTION_GROUPS, bloques por job
+- `nasdaq.ts` — eliminado (reemplazado por jobs/nasdaq-analysis.ts)
+- TypeScript: errores preexistentes en agent.ts corregidos (GeminiResponse type + implicit any)
+
+**Archivos modificados:**
+- `ai-bot/src/config.ts`
+- `ai-bot/src/scheduler.ts`
+- `ai-bot/src/server.ts`
+- `ai-bot/src/agent.ts`
+- `ai-bot/.env`
+- `ai-bot/.env.example`
+
+**Archivos creados:**
+- `ai-bot/src/jobs/voice.ts`
+- `ai-bot/src/jobs/nasdaq-analysis.ts`
+- `ai-bot/src/jobs/trading-tips.ts`
+- `ai-bot/src/jobs/news-share.ts`
+
+**Archivos eliminados:**
+- `ai-bot/src/nasdaq.ts` (reemplazado)
+
+**Próximos pasos:**
+- Probar: `cd ai-bot && npm run dev` con TEST_MODE=true → verificar los 3 mensajes en el grupo de prueba
+- Cuando listo para producción: TEST_MODE=false, añadir grupos a PRODUCTION_GROUPS en .env
+- Pendiente: despliegue Oracle Cloud (ver oracle-deploy.md)
+
+---
+
+## 2026-06-17 — Merge upstream + fork bacourosp/OpenWA configurado
+
+**Qué se hizo:**
+- Diagnóstico: merge interrumpido (106 commits upstream pendientes, 1 conflicto en `dashboard/Dockerfile`)
+- Conflicto resuelto: conservado `node:22-alpine` (razón: npm 11 evita ERESOLVE con peer deps)
+- Merge completado: `197089a` — 244 archivos, 21k+ líneas del upstream integradas
+- Fork creado: `bacourosp/OpenWA` en GitHub (cuenta autenticada `bacourosp`)
+- Remote `fork` agregado apuntando a `https://github.com/bacourosp/OpenWA.git`
+- Push exitoso a `fork/main`
+
+**Archivos modificados:**
+- `dashboard/Dockerfile` — conflicto resuelto
+
+**Remotes configurados:**
+- `origin` → `rmyndharis/OpenWA` (upstream, solo fetch)
+- `fork` → `bacourosp/OpenWA` (propio, siempre pushear aquí)
+
+**Próximos pasos:**
+- Crear cuenta Oracle Cloud → VM Ampere A1 (4 CPU / 24 GB RAM) — ver `.obsidian-memory/features/oracle-deploy.md`
+- Compartir IP pública + clave SSH para que Claude complete el despliegue
+- Agregar grupos de producción a `ALLOWED_CHATS` en `ai-bot/.env`
+- Para futuros syncs del upstream: `git pull origin main` → resolver conflictos → `git push fork main`
+
+---
+
 ## 2026-06-17 — AI-bot estable + precio NASDAQ en tiempo real + guía despliegue Oracle
 
 **Qué se hizo:**

@@ -100,6 +100,11 @@ export async function generateReply(input: InboundContext): Promise<string> {
  * If the model rejects the `google_search` tool, retries once without it (degraded) so the job
  * still produces output.
  */
+interface GeminiResponse {
+  candidates?: { content?: { parts?: { text?: string }[] } }[];
+  error?: { message?: string };
+}
+
 export async function generateWithSearch(systemInstruction: string, userPrompt: string): Promise<string> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${config.geminiSearchModel}:generateContent`;
   const body = (withSearch: boolean): string =>
@@ -128,5 +133,5 @@ export async function generateWithSearch(systemInstruction: string, userPrompt: 
   if (!r.ok) {
     throw new Error(`gemini ${r.status}: ${r.data.error?.message || JSON.stringify(r.data).slice(0, 200)}`);
   }
-  return (r.data.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
+  return (r.data.candidates?.[0]?.content?.parts || []).map((p: { text?: string }) => p.text || '').join('').trim();
 }
