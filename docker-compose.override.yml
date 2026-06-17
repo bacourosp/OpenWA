@@ -1,0 +1,43 @@
+# OpenWA AI companion — merged automatically with docker-compose.dev.yml.
+# Run: docker compose -f docker-compose.dev.yml -f docker-compose.override.yml up -d
+#
+# The ai-bot launches the Obsidian vector-RAG MCP server itself (as a stdio child,
+# see ai-bot/mcp-servers.json), so no separate MCP container is needed. Your Obsidian
+# vault is mounted read-only at /vault.
+services:
+  # Limpia el lock de Chromium (SingletonLock) en cada arranque: tras un apagado abrupto queda
+  # bloqueado el perfil y la sesión no reconecta. Entrypoint sigue siendo dumb-init.
+  openwa:
+    command:
+      - sh
+      - -c
+      - "find /app/data/sessions -name 'Singleton*' -delete 2>/dev/null; exec node dist/main"
+
+  ai-bot:
+    build:
+      context: ./ai-bot
+      dockerfile: Dockerfile
+    container_name: openwa-ai-bot
+    env_file:
+      - ./ai-bot/.env
+    environment:
+      - PORT=3000
+      - OPENWA_BASE_URL=http://openwa:2785/api
+    volumes:
+      # Editable at runtime (persona is read on each message) — no rebuild needed:
+      - ./ai-bot/system-prompt.md:/app/system-prompt.md:ro
+      # Your knowledge base (Obsidian vault). Override the host path with VAULT_HOST_PATH.
+      - ${VAULT_HOST_PATH:-./data/vault}:/vault:ro
+    depends_on:
+      openwa:
+        condition: service_healthy
+    extra_hosts:
+      # lets an Ollama embeddings server on the host be reached at host.docker.internal
+      - 'host.docker.internal:host-gateway'
+    networks:
+      default:
+        # dotted alias: OpenWA's webhook DTO uses @IsUrl() which rejects dot-less hostnames,
+        # so register the webhook as http://ai-bot.local:3000/webhook
+        aliases:
+          - ai-bot.local
+    restart: unless-stopped

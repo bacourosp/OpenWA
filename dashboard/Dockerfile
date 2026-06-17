@@ -1,4 +1,4 @@
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 
@@ -6,7 +6,8 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies
-RUN npm ci
+# node 22 + npm 11 resolves the locked peer deps cleanly (node:20-alpine's npm 10 trips ERESOLVE)
+RUN npm ci --legacy-peer-deps
 
 # Copy source code
 COPY . .

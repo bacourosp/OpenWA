@@ -1,0 +1,24 @@
+{
+  "name": "openwa-ai-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Obsidian-grounded AI auto-reply companion for OpenWA. Receives webhooks, filters allowed groups, answers from your vault via an MCP RAG server, and replies through the OpenWA API.",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "node-cron": "^3.0.3",
+    "tsx": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.0",
+    "@types/node-cron": "^3.0.11",
+    "typescript": "^5.7.2"
+  }
+}
