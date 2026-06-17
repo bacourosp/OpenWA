@@ -1,15 +1,18 @@
-import { Injectable, CanActivate, ExecutionContext, UnauthorizedException } from '@nestjs/common';
+import { Injectable, CanActivate, ExecutionContext, UnauthorizedException, ForbiddenException } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
+import { ConfigService } from '@nestjs/config';
 import { Request } from 'express';
 import { AuthService } from '../auth.service';
 import { ApiKeyRole } from '../entities/api-key.entity';
 import { REQUIRED_ROLE_KEY, PUBLIC_KEY } from '../decorators/auth.decorators';
+import { resolveClientIp } from '../../../common/utils/ip';
 
 @Injectable()
 export class ApiKeyGuard implements CanActivate {
   constructor(
     private readonly authService: AuthService,
     private readonly reflector: Reflector,
+    private readonly configService: ConfigService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -41,7 +44,7 @@ export class ApiKeyGuard implements CanActivate {
     ]);
 
     if (requiredRole && !this.authService.hasPermission(apiKey, requiredRole)) {
-      throw new UnauthorizedException(`Insufficient permissions. Required: ${requiredRole}`);
+      throw new ForbiddenException(`Insufficient permissions. Required: ${requiredRole}`);
     }
 
     // Attach API key to request for use in controllers
@@ -63,12 +66,16 @@ export class ApiKeyGuard implements CanActivate {
     return undefined;
   }
 
+  /**
+   * Resolve the real client IP used for the API key's allowedIps whitelist.
+   *
+   * X-Forwarded-For is client-controllable, so it is only honored when the
+   * request actually arrives from a configured trusted proxy (TRUSTED_PROXIES).
+   * With no trusted proxies configured, the header is ignored entirely and the
+   * direct socket address is used — preventing IP-whitelist spoofing.
+   */
   private getClientIp(request: Request): string {
-    const forwarded = request.headers['x-forwarded-for'];
-    if (forwarded) {
-      const ips = (forwarded as string).split(',');
-      return ips[0].trim();
-    }
-    return request.ip || request.socket.remoteAddress || '';
+    const trustedProxies = this.configService.get<string[]>('security.trustedProxies') ?? [];
+    return resolveClientIp(request, trustedProxies);
   }
 }

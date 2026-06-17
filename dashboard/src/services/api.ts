@@ -1,7 +1,16 @@
 // API Service Layer for OpenWA Dashboard
 // Centralized API client with TypeScript types
 
-const API_BASE_URL = '/api';
+// Resolve the API base URL. By default this is the same-origin relative path '/api',
+// correct when the dashboard and API are served from the same origin (the default
+// single-container setup). For a split-origin deployment (dashboard hosted separately
+// from the API), set VITE_API_URL at build time to the API ORIGIN — e.g.
+// `VITE_API_URL=https://gateway.example.com` — and the '/api' prefix is appended here.
+// Previously VITE_API_URL was documented but never read, so the dashboard always called
+// same-origin '/api' and a split deployment failed with "Invalid API Key" (#91).
+// Exported so direct fetches (e.g. auth/validate in Login.tsx / App.tsx) honor VITE_API_URL
+// too — otherwise split-origin deployments break. Empty VITE_API_URL → '/api'.
+export const API_BASE_URL = `${(import.meta.env.VITE_API_URL ?? '').replace(/\/+$/, '')}/api`;
 
 // =============================================================================
 // Types
@@ -10,12 +19,14 @@ const API_BASE_URL = '/api';
 export interface Session {
   id: string;
   name: string;
-  status: 'created' | 'idle' | 'initializing' | 'connecting' | 'qr_ready' | 'ready' | 'disconnected';
+  status: 'created' | 'idle' | 'initializing' | 'connecting' | 'qr_ready' | 'ready' | 'disconnected' | 'failed';
   phone?: string;
   pushName?: string;
   lastActive?: string;
   createdAt: string;
   updatedAt: string;
+  /** Human-readable reason for the most recent terminal engine failure (set only when status is 'failed'). */
+  lastError?: string | null;
 }
 
 export interface SessionStats {
@@ -38,11 +49,29 @@ export interface Webhook {
   updatedAt: string;
 }
 
+export interface MessageTemplate {
+  id: string;
+  sessionId: string;
+  name: string;
+  body: string;
+  header?: string | null;
+  footer?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TemplatePayload {
+  name: string;
+  body: string;
+  header?: string | null;
+  footer?: string | null;
+}
+
 export interface ApiKey {
   id: string;
   name: string;
   keyPrefix: string;
-  role: 'admin' | 'user' | 'readonly';
+  role: 'admin' | 'operator' | 'viewer';
   allowedIps?: string[];
   allowedSessions?: string[];
   isActive: boolean;
@@ -74,6 +103,66 @@ export interface MessageResponse {
   timestamp: number;
 }
 
+// Chat summary returned by GET /sessions/:id/chats (mirrors the backend ChatSummary).
+export interface Chat {
+  id: string;
+  name: string;
+  isGroup: boolean;
+  unreadCount: number;
+  timestamp: number;
+  lastMessage?: string;
+}
+
+// Engine-neutral message types (mirrors the backend's IWhatsAppEngine MessageType). The backend
+// normalizes raw engine tokens at the adapter boundary (#265/#270), so persisted rows, the
+// message.received/sent payloads, and the websocket all use these values.
+export const MESSAGE_TYPES = [
+  'text',
+  'image',
+  'video',
+  'audio',
+  'voice',
+  'document',
+  'sticker',
+  'location',
+  'contact',
+  'revoked',
+  'unknown',
+] as const;
+export type MessageType = (typeof MESSAGE_TYPES)[number];
+
+/** Coerce an arbitrary string (e.g. a raw websocket payload field) to a known MessageType. */
+export function asMessageType(value: string | undefined): MessageType {
+  return (MESSAGE_TYPES as readonly string[]).includes(value ?? '') ? (value as MessageType) : 'unknown';
+}
+
+export interface ChatMessage {
+  id: string;
+  waMessageId?: string;
+  chatId: string;
+  from: string;
+  to: string;
+  body: string;
+  type: MessageType;
+  direction: 'incoming' | 'outgoing';
+  status: 'pending' | 'sent' | 'delivered' | 'read' | 'failed';
+  timestamp?: number;
+  createdAt: string;
+  metadata?: {
+    media?: { mimetype: string; filename?: string; data?: string };
+    quotedMessage?: { id: string; body: string };
+    reactions?: Record<string, string>;
+  };
+}
+
+export interface SendMediaPayload {
+  base64?: string;
+  url?: string;
+  mimetype?: string;
+  filename?: string;
+  caption?: string;
+}
+
 export interface HealthStatus {
   status: 'ok' | 'error';
   timestamp?: string;
@@ -96,6 +185,35 @@ export interface InfraStatus {
   engine: { type: string; headless: boolean };
 }
 
+// Saved infrastructure config (from data/.env.generated) used to hydrate the form.
+// Secrets are never returned — `*Set` flags indicate whether a value is stored.
+export interface SavedConfig {
+  database: {
+    type: 'sqlite' | 'postgres';
+    builtIn: boolean;
+    host: string;
+    port: string;
+    username: string;
+    database: string;
+    poolSize: number;
+    sslEnabled: boolean;
+    sslRejectUnauthorized: boolean;
+    passwordSet: boolean;
+  };
+  redis: { enabled: boolean; builtIn: boolean; host: string; port: string; passwordSet: boolean };
+  queue: { enabled: boolean };
+  storage: {
+    type: 'local' | 's3';
+    builtIn: boolean;
+    localPath: string;
+    s3Bucket: string;
+    s3Region: string;
+    s3Endpoint: string;
+    s3CredentialsSet: boolean;
+  };
+  engine: { headless: boolean; sessionDataPath: string; browserArgs: string };
+}
+
 export interface SaveConfigPayload {
   database?: {
     type: 'sqlite' | 'postgres';
@@ -107,6 +225,7 @@ export interface SaveConfigPayload {
     database?: string;
     poolSize?: number;
     sslEnabled?: boolean;
+    sslRejectUnauthorized?: boolean;
   };
   redis?: {
     enabled?: boolean;
@@ -159,6 +278,18 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
 
   const response = await fetch(url, { ...options, headers });
 
+  if (response.status === 401) {
+    // The stored API key is invalid/expired/revoked — clear it and return to login
+    // so the user isn't stuck on a dashboard that 401s every request.
+    sessionStorage.removeItem('openwa_api_key');
+    if (typeof window !== 'undefined') {
+      window.location.assign('/');
+      // The page is navigating away — halt this request's promise chain so callers neither
+      // throw the generic error below (flashing a toast) nor receive an undefined payload.
+      return new Promise<T>(() => {});
+    }
+  }
+
   if (!response.ok) {
     const error = await response.json().catch(() => ({ message: response.statusText }));
     throw new Error(error.message || `HTTP ${response.status}`);
@@ -188,7 +319,18 @@ export const sessionApi = {
   stop: (id: string) => request<Session>(`/sessions/${id}/stop`, { method: 'POST' }),
   getQR: (id: string) => request<{ qrCode: string; status: string }>(`/sessions/${id}/qr`),
   getStats: () => request<SessionStats>('/sessions/stats/overview'),
-  getGroups: (id: string) => request<{ id: string; name: string }[]>(`/sessions/${id}/groups`),
+  getGroups: (id: string) =>
+    request<{ id: string; name: string; linkedParentJID?: string | null }[]>(`/sessions/${id}/groups`),
+  getChats: (id: string) => request<Chat[]>(`/sessions/${id}/chats`),
+  markChatRead: (id: string, chatId: string) =>
+    request<{ success: boolean }>(`/sessions/${id}/chats/read`, {
+      method: 'POST',
+      body: JSON.stringify({ chatId }),
+    }),
+  getChatMessages: (id: string, chatId: string, limit = 100) =>
+    request<{ messages: ChatMessage[]; total: number }>(
+      `/sessions/${id}/messages?chatId=${encodeURIComponent(chatId)}&limit=${limit}`,
+    ),
 };
 
 // =============================================================================
@@ -215,6 +357,43 @@ export const webhookApi = {
     request<{ success: boolean; statusCode?: number; error?: string }>(`/sessions/${sessionId}/webhooks/${id}/test`, {
       method: 'POST',
     }),
+};
+
+// =============================================================================
+// Template API
+// =============================================================================
+
+export const templateApi = {
+  list: (sessionId: string) => request<MessageTemplate[]>(`/sessions/${sessionId}/templates`),
+  get: (sessionId: string, id: string) => request<MessageTemplate>(`/sessions/${sessionId}/templates/${id}`),
+  create: (sessionId: string, data: TemplatePayload) =>
+    request<MessageTemplate>(`/sessions/${sessionId}/templates`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  update: (sessionId: string, id: string, data: Partial<TemplatePayload>) =>
+    request<MessageTemplate>(`/sessions/${sessionId}/templates/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  delete: (sessionId: string, id: string) =>
+    request<void>(`/sessions/${sessionId}/templates/${id}`, { method: 'DELETE' }),
+};
+
+// =============================================================================
+// Contact API
+// =============================================================================
+
+export interface CheckNumberResponse {
+  number: string;
+  exists: boolean;
+  /** Engine-canonical WhatsApp id for the number (e.g. `…@c.us` or `…@lid`), or null if unregistered. */
+  whatsappId: string | null;
+}
+
+export const contactApi = {
+  checkNumber: (sessionId: string, number: string) =>
+    request<CheckNumberResponse>(`/sessions/${sessionId}/contacts/check/${encodeURIComponent(number)}`),
 };
 
 // =============================================================================
@@ -290,6 +469,39 @@ export const messageApi = {
       method: 'POST',
       body: JSON.stringify({ chatId, url, filename }),
     }),
+  sendMedia: (
+    sessionId: string,
+    chatId: string,
+    mediaType: 'image' | 'video' | 'audio' | 'document',
+    payload: SendMediaPayload,
+  ) =>
+    request<MessageResponse>(`/sessions/${sessionId}/messages/send-${mediaType}`, {
+      method: 'POST',
+      body: JSON.stringify({ chatId, ...payload }),
+    }),
+  reply: (sessionId: string, data: { chatId: string; quotedMessageId: string; text: string }) =>
+    request<MessageResponse>(`/sessions/${sessionId}/messages/reply`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  react: (sessionId: string, data: { chatId: string; messageId: string; emoji: string }) =>
+    request<void>(`/sessions/${sessionId}/messages/react`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  sendTemplate: (
+    sessionId: string,
+    data: { chatId: string; templateId?: string; templateName?: string; variables?: Record<string, string> },
+  ) =>
+    request<MessageResponse>(`/sessions/${sessionId}/messages/send-template`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  delete: (sessionId: string, data: { chatId: string; messageId: string; forEveryone?: boolean }) =>
+    request<void>(`/sessions/${sessionId}/messages/delete`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 };
 
 // =============================================================================
@@ -303,6 +515,7 @@ export const healthApi = {
 
 export const infraApi = {
   getStatus: () => request<InfraStatus>('/infra/status'),
+  getConfig: () => request<SavedConfig>('/infra/config'),
   updateConfig: (config: Partial<InfraStatus>) =>
     request<InfraStatus>('/infra/config', {
       method: 'PUT',
@@ -365,6 +578,8 @@ export interface Engine {
   name: string;
   enabled: boolean;
   features: string[];
+  /** Underlying engine library (e.g. whatsapp-web.js 1.34.7), distinct from the adapter version. */
+  library?: { name: string; version: string };
 }
 
 // =============================================================================

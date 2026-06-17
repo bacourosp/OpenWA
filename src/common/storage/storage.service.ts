@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as archiver from 'archiver';
+import { TarArchive } from 'archiver';
 import * as tar from 'tar-stream';
 import { createGunzip } from 'zlib';
 import { Readable, PassThrough } from 'stream';
@@ -15,6 +15,7 @@ import {
   CreateBucketCommand,
 } from '@aws-sdk/client-s3';
 import { createLogger } from '../services/logger.service';
+import { isPathWithin } from '../utils/path-safety';
 
 interface S3Config {
   endpoint?: string;
@@ -41,8 +42,11 @@ export class StorageService {
     if (this.storageType === 's3') {
       const s3Config = this.configService.get<S3Config>('storage.s3') || {};
       const endpoint = process.env.S3_ENDPOINT || s3Config.endpoint;
-      const accessKeyId = process.env.S3_ACCESS_KEY || s3Config.accessKeyId;
-      const secretAccessKey = process.env.S3_SECRET_KEY || s3Config.secretAccessKey;
+      // Canonical names are S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY (what configuration.ts
+      // and the dashboard write). The legacy S3_ACCESS_KEY / S3_SECRET_KEY are still read as
+      // a fallback so existing .env files keep working.
+      const accessKeyId = process.env.S3_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY || s3Config.accessKeyId;
+      const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY || process.env.S3_SECRET_KEY || s3Config.secretAccessKey;
       const region = process.env.S3_REGION || s3Config.region || 'us-east-1';
 
       if (endpoint && accessKeyId && secretAccessKey) {
@@ -153,9 +157,16 @@ export class StorageService {
     const files = await this.listFiles();
     const output = new PassThrough();
 
-    const archive = archiver.default('tar', {
+    const archive = new TarArchive({
       gzip: true,
       gzipOptions: { level: 6 },
+    });
+
+    // Surface archive-level failures (gzip/finalize) on the returned stream instead of
+    // letting them become an unhandled rejection or a silently truncated download.
+    archive.on('error', (err: Error) => {
+      this.logger.error('Export archive failed', String(err));
+      output.destroy(err);
     });
 
     archive.pipe(output);
@@ -170,7 +181,9 @@ export class StorageService {
       }
     }
 
-    void archive.finalize();
+    // finalize() rejections also emit via the 'error' handler above; catch the promise so it
+    // never surfaces as an unhandled rejection.
+    archive.finalize().catch(() => undefined);
     return output;
   }
 
@@ -247,11 +260,17 @@ export class StorageService {
   }
 
   private getLocalFile(filePath: string): Promise<Buffer> {
+    if (!isPathWithin(this.localPath, filePath)) {
+      throw new Error(`Refusing to read outside storage root: ${filePath}`);
+    }
     const fullPath = path.join(this.localPath, filePath);
     return Promise.resolve(fs.readFileSync(fullPath));
   }
 
   private putLocalFile(filePath: string, data: Buffer): Promise<void> {
+    if (!isPathWithin(this.localPath, filePath)) {
+      throw new Error(`Refusing to write outside storage root: ${filePath}`);
+    }
     const fullPath = path.join(this.localPath, filePath);
     const dir = path.dirname(fullPath);
 

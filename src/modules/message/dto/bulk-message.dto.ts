@@ -1,6 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsString,
+  IsIn,
   IsArray,
   IsOptional,
   IsNumber,
@@ -19,15 +20,19 @@ class BulkMessageContentDto {
   text?: string;
 
   @ApiPropertyOptional({ description: 'Image URL or base64' })
+  @IsOptional()
   image?: { url?: string; base64?: string; mimetype?: string };
 
   @ApiPropertyOptional({ description: 'Video URL or base64' })
+  @IsOptional()
   video?: { url?: string; base64?: string; mimetype?: string };
 
   @ApiPropertyOptional({ description: 'Audio URL or base64' })
+  @IsOptional()
   audio?: { url?: string; base64?: string; mimetype?: string };
 
   @ApiPropertyOptional({ description: 'Document URL or base64' })
+  @IsOptional()
   document?: { url?: string; base64?: string; mimetype?: string; filename?: string };
 
   @ApiPropertyOptional({ description: 'Caption for media messages' })
@@ -42,7 +47,7 @@ class BulkMessageItemDto {
   chatId: string;
 
   @ApiProperty({ description: 'Message type', enum: ['text', 'image', 'video', 'audio', 'document'] })
-  @IsString()
+  @IsIn(['text', 'image', 'video', 'audio', 'document'])
   type: 'text' | 'image' | 'video' | 'audio' | 'document';
 
   @ApiProperty({ description: 'Message content based on type' })

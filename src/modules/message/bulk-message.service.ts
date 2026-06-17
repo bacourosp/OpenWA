@@ -1,4 +1,4 @@
-import { Injectable, Logger, BadRequestException, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException, NotFoundException, OnApplicationBootstrap } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { randomUUID } from 'crypto';
@@ -23,8 +23,25 @@ interface BulkMessageContent {
   document?: { url?: string; base64?: string; mimetype?: string; filename?: string };
 }
 
+/**
+ * Resolve a batch's terminal status, in precedence order:
+ *  - cancelled (cancelBatch flipped the flag) → CANCELLED. Must win over the in-memory PROCESSING
+ *    status set at the start of processBatch, which would otherwise be saved back over the cancellation.
+ *  - stopped on the first error (stopOnError) → FAILED, even if some messages were already sent.
+ *  - otherwise → COMPLETED, or FAILED only when every attempt failed.
+ */
+export function resolveFinalBatchStatus(
+  cancelled: boolean,
+  stoppedOnError: boolean,
+  progress: Pick<BatchProgress, 'sent' | 'failed'>,
+): BatchStatus {
+  if (cancelled) return BatchStatus.CANCELLED;
+  if (stoppedOnError) return BatchStatus.FAILED;
+  return progress.failed > 0 && progress.sent === 0 ? BatchStatus.FAILED : BatchStatus.COMPLETED;
+}
+
 @Injectable()
-export class BulkMessageService {
+export class BulkMessageService implements OnApplicationBootstrap {
   private readonly logger = new Logger(BulkMessageService.name);
   private readonly processingBatches = new Map<string, boolean>(); // Track active batches for cancellation
 
@@ -33,6 +50,25 @@ export class BulkMessageService {
     private readonly batchRepository: Repository<MessageBatch>,
     private readonly sessionService: SessionService,
   ) {}
+
+  /**
+   * Transition orphaned batches on startup. A batch still in PROCESSING belongs to a
+   * previous (crashed/restarted) process — this fresh process is not driving it, so it would
+   * otherwise be stuck in PROCESSING forever. Mark it FAILED. Auto-resume is intentionally NOT
+   * done here: resuming risks re-sending messages already delivered before the crash.
+   */
+  async onApplicationBootstrap(): Promise<void> {
+    const orphaned = await this.batchRepository.find({ where: { status: BatchStatus.PROCESSING } });
+    for (const batch of orphaned) {
+      batch.status = BatchStatus.FAILED;
+      await this.batchRepository.save(batch);
+    }
+    if (orphaned.length > 0) {
+      this.logger.warn(
+        `Marked ${orphaned.length} orphaned PROCESSING batch(es) FAILED on startup (interrupted by a restart)`,
+      );
+    }
+  }
 
   async createBatch(sessionId: string, dto: SendBulkMessageDto): Promise<MessageBatch> {
     // Validate session exists
@@ -145,6 +181,7 @@ export class BulkMessageService {
     }
 
     const results: BatchMessageResult[] = batch.results || [];
+    let stoppedOnError = false;
 
     for (let i = batch.currentIndex; i < batch.messages.length; i++) {
       // Check for cancellation
@@ -161,7 +198,7 @@ export class BulkMessageService {
 
       try {
         // Apply template variables
-        const content: BulkMessageContent = this.applyVariables(msg.content as BulkMessageContent, msg.variables);
+        const content: BulkMessageContent = this.applyVariables(msg.content, msg.variables);
 
         // Send message based on type
         const messageResult = await this.sendMessage(engine, msg.chatId, msg.type, content);
@@ -186,6 +223,7 @@ export class BulkMessageService {
 
         if (batch.options.stopOnError) {
           batch.status = BatchStatus.FAILED;
+          stoppedOnError = true;
           results.push(result);
           break;
         }
@@ -207,10 +245,14 @@ export class BulkMessageService {
       }
     }
 
-    // Final update
-    if (this.processingBatches.get(batch.id)) {
-      batch.status =
-        batch.progress.failed > 0 && batch.progress.sent === 0 ? BatchStatus.FAILED : BatchStatus.COMPLETED;
+    // Final update. NOTE: `batch` still holds the in-memory PROCESSING status from the start, so a
+    // cancellation persisted by cancelBatch would be overwritten if we saved without re-deriving it.
+    const cancelled = !this.processingBatches.get(batch.id);
+    batch.status = resolveFinalBatchStatus(cancelled, stoppedOnError, batch.progress);
+    if (cancelled) {
+      // Reconcile the counters the same way cancelBatch does, so the persisted state is consistent.
+      batch.progress.cancelled = batch.progress.pending;
+      batch.progress.pending = 0;
     }
     batch.completedAt = new Date();
     batch.results = results;
@@ -223,6 +265,12 @@ export class BulkMessageService {
   private applyVariables(content: BulkMessageContent, variables?: Record<string, string>): BulkMessageContent {
     if (!variables) return content;
 
+    // NOTE: This single-brace `{name}` convention differs from the shared
+    // server-side template renderer (`renderTemplate` in
+    // common/utils/template-render.ts) which uses double-brace `{{name}}`
+    // placeholders. The two conventions should be reconciled onto the shared
+    // helper in a follow-up so the gateway exposes one consistent templating
+    // syntax. See issue #69.
     const replaceVars = (str: string): string => {
       return str.replace(/\{(\w+)\}/g, (_, key: string) => variables[key] || `{${key}}`);
     };

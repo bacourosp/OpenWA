@@ -1,8 +1,18 @@
 import { Controller, Get, Post, Delete, Param, Body, HttpCode, HttpStatus } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
 import { SessionService } from './session.service';
-import { CreateSessionDto, SessionResponseDto, QRCodeResponseDto } from './dto';
+import {
+  CreateSessionDto,
+  SessionResponseDto,
+  QRCodeResponseDto,
+  MarkChatReadDto,
+  DeleteChatDto,
+  SendChatStateDto,
+  RequestPairingCodeDto,
+  PairingCodeResponseDto,
+} from './dto';
 import { Session } from './entities/session.entity';
+import { ChatSummary } from '../../engine/interfaces/whatsapp-engine.interface';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { RequireRole } from '../auth/decorators/auth.decorators';
@@ -28,6 +38,7 @@ export class SessionController {
       lastActive: session.lastActiveAt,
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
+      lastError: session.lastError ?? null,
     };
   }
 
@@ -133,6 +144,7 @@ export class SessionController {
   }
 
   @Get(':id/qr')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Get QR code for session authentication' })
   @ApiParam({ name: 'id', description: 'Session ID' })
   @ApiResponse({
@@ -153,6 +165,20 @@ export class SessionController {
     return qrCode;
   }
 
+  @Post(':id/pairing-code')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({ summary: 'Request an 8-char pairing code to link via phone number (alternative to QR)' })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({ status: 201, description: 'Pairing code generated', type: PairingCodeResponseDto })
+  @ApiResponse({ status: 400, description: 'Session not started or already authenticated' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async requestPairingCode(
+    @Param('id') id: string,
+    @Body() dto: RequestPairingCodeDto,
+  ): Promise<PairingCodeResponseDto> {
+    return this.sessionService.requestPairingCode(id, dto.phoneNumber);
+  }
+
   @Get(':id/groups')
   @ApiOperation({ summary: 'Get all groups for a session' })
   @ApiParam({ name: 'id', description: 'Session ID' })
@@ -162,8 +188,53 @@ export class SessionController {
   })
   @ApiResponse({ status: 400, description: 'Session not ready' })
   @ApiResponse({ status: 404, description: 'Session not found' })
-  async getGroups(@Param('id') id: string): Promise<{ id: string; name: string }[]> {
+  async getGroups(@Param('id') id: string): Promise<{ id: string; name: string; linkedParentJID?: string | null }[]> {
     return this.sessionService.getGroups(id);
+  }
+
+  @Get(':id/chats')
+  @ApiOperation({ summary: 'Get active chats for a session' })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'List of active chats' })
+  @ApiResponse({ status: 400, description: 'Session not ready' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async getChats(@Param('id') id: string): Promise<ChatSummary[]> {
+    return this.sessionService.getChats(id);
+  }
+
+  @Post(':id/chats/read')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({ summary: 'Mark a chat as read/seen' })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'Chat marked as read successfully' })
+  @ApiResponse({ status: 400, description: 'Session not ready' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async markChatRead(@Param('id') id: string, @Body() dto: MarkChatReadDto): Promise<{ success: boolean }> {
+    const success = await this.sessionService.sendSeen(id, dto.chatId);
+    return { success };
+  }
+
+  @Post(':id/chats/delete')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({ summary: 'Delete a chat from the chat list (e.g. a group you have left)' })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'Chat deleted successfully' })
+  @ApiResponse({ status: 400, description: 'Session not ready' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async deleteChat(@Param('id') id: string, @Body() dto: DeleteChatDto): Promise<{ success: boolean }> {
+    const success = await this.sessionService.deleteChat(id, dto.chatId);
+    return { success };
+  }
+
+  @Post(':id/chats/typing')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({ summary: "Send a typing/recording presence indicator to a chat (or clear it with 'paused')" })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'Presence sent' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async sendChatState(@Param('id') id: string, @Body() dto: SendChatStateDto): Promise<{ success: boolean }> {
+    await this.sessionService.sendChatState(id, dto.chatId, dto.state);
+    return { success: true };
   }
 
   @Get('stats/overview')

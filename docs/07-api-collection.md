@@ -435,40 +435,16 @@ curl -X POST http://localhost:2785/api/sessions/default/messages \
 }
 ```
 
-**Request Body - Buttons (Interactive):**
-```json
-{
-  "phone": "628123456789@c.us",
-  "type": "buttons",
-  "body": "Please choose an option:",
-  "buttons": [
-    { "id": "btn1", "text": "Option 1" },
-    { "id": "btn2", "text": "Option 2" },
-    { "id": "btn3", "text": "Option 3" }
-  ],
-  "footer": "Powered by OpenWA"
-}
-```
+**Interactive messages (Buttons / List): not supported**
 
-**Request Body - List (Interactive):**
-```json
-{
-  "phone": "628123456789@c.us",
-  "type": "list",
-  "body": "Please select from the menu:",
-  "buttonText": "View Menu",
-  "sections": [
-    {
-      "title": "Category 1",
-      "rows": [
-        { "id": "item1", "title": "Item 1", "description": "Description 1" },
-        { "id": "item2", "title": "Item 2", "description": "Description 2" }
-      ]
-    }
-  ],
-  "footer": "Powered by OpenWA"
-}
-```
+> ⚠️ **Buttons and List (interactive) messages are not available** through OpenWA's
+> whatsapp-web.js engine. WhatsApp stopped honoring the interactive-message payload
+> for unofficial web clients around 2021–2022 — the `Buttons` / `List` classes still
+> exist in the library, but messages built with them are **silently dropped and never
+> delivered** to recipients. OpenWA therefore does not expose `type: "buttons"` or
+> `type: "list"` endpoints; sending interactive messages requires the official
+> WhatsApp Business Cloud API. (The earlier examples here were speculative and never
+> implemented — see #158.)
 
 **Response:**
 ```json
@@ -612,25 +588,26 @@ curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions/default/contacts/628123456789
 ```
 
-### GET /api/sessions/:id/contacts/:phone/exists
+### GET /api/sessions/:id/contacts/check/:number
 
 Check if number exists on WhatsApp.
 
 ```bash
 curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/sessions/default/contacts/628123456789/exists
+  http://localhost:2785/api/sessions/default/contacts/check/628123456789
 ```
 
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "exists": true,
-    "jid": "628123456789@c.us"
-  }
+  "number": "628123456789",
+  "exists": true,
+  "whatsappId": "628123456789@c.us"
 }
 ```
+
+`whatsappId` is the engine's canonical WhatsApp ID (`null` when `exists` is
+`false`); it may be normalized and differ from the submitted number.
 
 ### POST /api/sessions/:id/contacts/:phone/block
 
@@ -1031,13 +1008,20 @@ curl -X POST \
 
 ## 07.8 API Keys API
 
-### GET /api/api-keys
+All API key management endpoints require an admin API key in `X-API-Key`.
+OpenWA creates the initial admin key on first run, prints it in the startup
+logs, and writes it to `data/.api-key` (or `/app/data/.api-key` inside the API
+container). By default a random `owa_k1_...` admin key is generated on first run
+in all environments; set `ALLOW_DEV_API_KEY=true` to seed the well-known
+`dev-admin-key` for local development only.
+
+### GET /api/auth/api-keys
 
 List API keys.
 
 ```bash
 curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/api-keys
+  http://localhost:2785/api/auth/api-keys
 ```
 
 **Response:**
@@ -1046,13 +1030,15 @@ curl -H "X-API-Key: $API_KEY" \
   "success": true,
   "data": [
     {
-      "id": "key_123",
+      "id": "2a8f41e3-3b9a-4a1d-b6d0-b9910df8f0be",
       "name": "Production Key",
-      "prefix": "owa_prod_***",
-      "permissions": ["*"],
-      "sessionAccess": ["*"],
-      "rateLimit": 1000,
-      "lastUsed": "2026-02-02T10:30:00Z",
+      "keyPrefix": "owa_k1_abcd",
+      "role": "operator",
+      "allowedIps": ["192.168.1.10"],
+      "allowedSessions": ["session-uuid-1"],
+      "isActive": true,
+      "lastUsedAt": "2026-02-02T10:30:00Z",
+      "usageCount": 12,
       "expiresAt": null,
       "createdAt": "2026-01-01T00:00:00Z"
     }
@@ -1060,38 +1046,28 @@ curl -H "X-API-Key: $API_KEY" \
 }
 ```
 
-### POST /api/api-keys
+### POST /api/auth/api-keys
 
 Create API key.
 
 ```bash
-curl -X POST http://localhost:2785/api/api-keys \
+curl -X POST http://localhost:2785/api/auth/api-keys \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Integration Key",
-    "permissions": ["sessions:read", "messages:write"],
-    "sessionAccess": ["default"],
-    "rateLimit": 100,
+    "role": "operator",
+    "allowedIps": ["192.168.1.10"],
+    "allowedSessions": ["default"],
     "expiresAt": "2027-01-01T00:00:00Z"
   }'
 ```
 
-**Permissions:**
+**Roles:**
 ```
-*                    - All permissions
-sessions:read        - Read session info
-sessions:write       - Create/delete sessions
-messages:read        - Read messages
-messages:write       - Send messages
-contacts:read        - Read contacts
-contacts:write       - Block/unblock contacts
-groups:read          - Read group info
-groups:write         - Manage groups
-webhooks:read        - Read webhooks
-webhooks:write       - Manage webhooks
-api-keys:read        - Read API keys
-api-keys:write       - Manage API keys
+admin     - Full access, including API key management
+operator  - Operational API access for integrations
+viewer    - Read-only API access where supported
 ```
 
 **Response:**
@@ -1099,28 +1075,65 @@ api-keys:write       - Manage API keys
 {
   "success": true,
   "data": {
-    "id": "key_456",
+    "id": "4d0564f1-5fb7-4e4a-baae-4cb0d154e861",
     "name": "Integration Key",
-    "key": "owa_abc123xyz789...",
-    "permissions": ["sessions:read", "messages:write"],
-    "sessionAccess": ["default"],
-    "rateLimit": 100,
+    "keyPrefix": "owa_k1_efgh",
+    "role": "operator",
+    "allowedIps": ["192.168.1.10"],
+    "allowedSessions": ["default"],
+    "isActive": true,
+    "usageCount": 0,
     "expiresAt": "2027-01-01T00:00:00Z",
-    "createdAt": "2026-02-02T10:30:00Z"
+    "createdAt": "2026-02-02T10:30:00Z",
+    "apiKey": "owa_k1_efgh5678..."
   }
 }
 ```
 
-**Note:** The full `key` is only shown once at creation.
+**Note:** The full `apiKey` is only shown once at creation.
 
-### DELETE /api/api-keys/:id
+### PUT /api/auth/api-keys/:id
 
-Revoke API key.
+Update API key metadata, role, IP allowlist, session allowlist, or expiry.
+
+```bash
+curl -X PUT http://localhost:2785/api/auth/api-keys/4d0564f1-5fb7-4e4a-baae-4cb0d154e861 \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Integration Key - Production",
+    "role": "operator"
+  }'
+```
+
+### POST /api/auth/api-keys/:id/revoke
+
+Revoke API key without deleting its record.
+
+```bash
+curl -X POST \
+  -H "X-API-Key: $API_KEY" \
+  http://localhost:2785/api/auth/api-keys/4d0564f1-5fb7-4e4a-baae-4cb0d154e861/revoke
+```
+
+### DELETE /api/auth/api-keys/:id
+
+Delete API key.
 
 ```bash
 curl -X DELETE \
   -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/api-keys/key_456
+  http://localhost:2785/api/auth/api-keys/4d0564f1-5fb7-4e4a-baae-4cb0d154e861
+```
+
+### POST /api/auth/validate
+
+Validate the API key provided in the `X-API-Key` header.
+
+```bash
+curl -X POST \
+  -H "X-API-Key: $API_KEY" \
+  http://localhost:2785/api/auth/validate
 ```
 
 ## 07.9 Postman Collection

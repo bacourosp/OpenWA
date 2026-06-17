@@ -3,7 +3,7 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { UnauthorizedException, NotFoundException } from '@nestjs/common';
 import { createHash } from 'crypto';
-import { AuthService } from './auth.service';
+import { AuthService, resolveSeedApiKey } from './auth.service';
 import { ApiKey, ApiKeyRole } from './entities/api-key.entity';
 
 // Helpers
@@ -27,6 +27,40 @@ function createMockApiKey(overrides: Partial<ApiKey> = {}): ApiKey {
     ...overrides,
   };
 }
+
+describe('resolveSeedApiKey (first-boot default admin key)', () => {
+  const ORIGINAL_ENV = process.env;
+
+  beforeEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+    delete process.env.API_MASTER_KEY;
+    delete process.env.ALLOW_DEV_API_KEY;
+  });
+
+  afterEach(() => {
+    process.env = ORIGINAL_ENV;
+  });
+
+  it('uses API_MASTER_KEY verbatim when set', () => {
+    process.env.API_MASTER_KEY = 'my-explicit-master-key';
+    expect(resolveSeedApiKey()).toBe('my-explicit-master-key');
+  });
+
+  it('generates a random owa_k1_ key by default (no opt-in)', () => {
+    expect(resolveSeedApiKey()).toMatch(/^owa_k1_[a-f0-9]{64}$/);
+  });
+
+  it('returns the fixed dev-admin-key only when ALLOW_DEV_API_KEY=true', () => {
+    process.env.ALLOW_DEV_API_KEY = 'true';
+    expect(resolveSeedApiKey()).toBe('dev-admin-key');
+  });
+
+  it('prefers API_MASTER_KEY over the dev opt-in', () => {
+    process.env.API_MASTER_KEY = 'master-wins';
+    process.env.ALLOW_DEV_API_KEY = 'true';
+    expect(resolveSeedApiKey()).toBe('master-wins');
+  });
+});
 
 describe('AuthService', () => {
   let service: AuthService;
@@ -190,6 +224,33 @@ describe('AuthService', () => {
       expect(result.lastUsedAt).toBeDefined();
     });
 
+    it('coalesces the usage-stat write within the throttle window', async () => {
+      const rawKey = 'recent-key';
+      const key = createMockApiKey({ keyHash: hashKey(rawKey), lastUsedAt: new Date(), usageCount: 5 });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+
+      const result = await service.validateApiKey(rawKey);
+
+      expect(repository.save).not.toHaveBeenCalled(); // throttled — no DB write this request
+      expect(result.usageCount).toBe(6); // but the count is still reflected in-memory
+      expect(result.lastUsedAt).toBeDefined();
+    });
+
+    it('flushes the usage-stat write once the throttle window has elapsed', async () => {
+      const rawKey = 'stale-key';
+      const key = createMockApiKey({
+        keyHash: hashKey(rawKey),
+        lastUsedAt: new Date(Date.now() - 5 * 60_000),
+        usageCount: 5,
+      });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.save as jest.Mock).mockImplementation(k => Promise.resolve(k));
+
+      await service.validateApiKey(rawKey);
+
+      expect(repository.save).toHaveBeenCalled(); // persisted after the window
+    });
+
     it('should throw UnauthorizedException for invalid key', async () => {
       (repository.findOne as jest.Mock).mockResolvedValue(null);
 
@@ -232,6 +293,16 @@ describe('AuthService', () => {
 
       const result = await service.validateApiKey('ip-ok', '10.0.0.1');
       expect(result.id).toBe(key.id);
+    });
+
+    it('should fail closed when an IP whitelist is set but the client IP is unknown', async () => {
+      const key = createMockApiKey({
+        allowedIps: ['10.0.0.1'],
+        keyHash: hashKey('ip-no-client'),
+      });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+
+      await expect(service.validateApiKey('ip-no-client')).rejects.toThrow('Client IP could not be determined');
     });
 
     it('should throw UnauthorizedException when session not in allowedSessions', async () => {

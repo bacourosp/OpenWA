@@ -1,9 +1,11 @@
-import { Controller, Get, Put, Post, Body } from '@nestjs/common';
+import { Controller, Get, Put, Post, Body, BadRequestException } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBody } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { DataSource } from 'typeorm';
 import { InjectDataSource } from '@nestjs/typeorm';
-import { Public } from '../auth/decorators/auth.decorators';
+import { Public, RequireRole } from '../auth/decorators/auth.decorators';
+import { ApiKeyRole } from '../auth/entities/api-key.entity';
+import { isPathWithin } from '../../common/utils/path-safety';
 import { EngineFactory } from '../../engine/engine.factory';
 import { DockerService } from '../docker';
 import { CacheService } from '../../common/cache/cache.service';
@@ -12,6 +14,7 @@ import { ShutdownService } from '../../common/services/shutdown.service';
 import { createLogger } from '../../common/services/logger.service';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as dotenv from 'dotenv';
 
 interface InfraStatus {
   database: { connected: boolean; type: string; host: string };
@@ -36,6 +39,7 @@ interface SaveConfigDto {
     database?: string;
     poolSize?: number;
     sslEnabled?: boolean;
+    sslRejectUnauthorized?: boolean;
   };
   redis?: {
     enabled?: boolean;
@@ -131,6 +135,35 @@ interface MigrationTables {
   messageBatches: MessageBatchRow[];
 }
 
+// Saved infrastructure config returned to the dashboard form for hydration. Secret
+// values are never echoed back — a `*Set` boolean indicates whether one is stored.
+interface SavedConfigResponse {
+  database: {
+    type: 'sqlite' | 'postgres';
+    builtIn: boolean;
+    host: string;
+    port: string;
+    username: string;
+    database: string;
+    poolSize: number;
+    sslEnabled: boolean;
+    sslRejectUnauthorized: boolean;
+    passwordSet: boolean;
+  };
+  redis: { enabled: boolean; builtIn: boolean; host: string; port: string; passwordSet: boolean };
+  queue: { enabled: boolean };
+  storage: {
+    type: 'local' | 's3';
+    builtIn: boolean;
+    localPath: string;
+    s3Bucket: string;
+    s3Region: string;
+    s3Endpoint: string;
+    s3CredentialsSet: boolean;
+  };
+  engine: { headless: boolean; sessionDataPath: string; browserArgs: string };
+}
+
 @ApiTags('infrastructure')
 @Controller('infra')
 export class InfraController {
@@ -150,6 +183,7 @@ export class InfraController {
   ) {}
 
   @Get('status')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get infrastructure status' })
   @ApiResponse({ status: 200, description: 'Infrastructure status' })
   async getStatus(): Promise<InfraStatus> {
@@ -190,6 +224,7 @@ export class InfraController {
   }
 
   @Get('engines')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get available WhatsApp engines' })
   @ApiResponse({ status: 200, description: 'List of available engines' })
   getEngines(): Array<{ id: string; name: string; enabled: boolean; features: string[] }> {
@@ -197,124 +232,219 @@ export class InfraController {
   }
 
   @Get('engines/current')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get current active engine' })
   @ApiResponse({ status: 200, description: 'Current engine info' })
   getCurrentEngine(): { engineType: string } {
     return { engineType: this.engineFactory.getCurrentEngine() };
   }
 
+  @Get('config')
+  @RequireRole(ApiKeyRole.ADMIN)
+  @ApiOperation({ summary: 'Read the saved infrastructure configuration for the dashboard form' })
+  @ApiResponse({ status: 200, description: 'Saved configuration (secrets omitted)' })
+  getConfig(): SavedConfigResponse {
+    const envPath = path.resolve(process.cwd(), 'data', '.env.generated');
+    const saved: Record<string, string> = fs.existsSync(envPath) ? dotenv.parse(fs.readFileSync(envPath, 'utf8')) : {};
+
+    // Secrets (passwords, S3 keys) are never returned; the form shows a "set" indicator
+    // and an empty submission preserves the stored value (see saveConfig). This lets the
+    // dashboard hydrate the form so a save no longer overwrites unseen fields (#226).
+    return {
+      database: {
+        type: saved.DATABASE_TYPE === 'postgres' ? 'postgres' : 'sqlite',
+        builtIn: saved.POSTGRES_BUILTIN === 'true',
+        host: saved.DATABASE_HOST || '',
+        port: saved.DATABASE_PORT || '',
+        username: saved.DATABASE_USERNAME || '',
+        database: saved.DATABASE_NAME || '',
+        poolSize: Number(saved.DATABASE_POOL_SIZE) || 10,
+        sslEnabled: saved.DATABASE_SSL === 'true',
+        sslRejectUnauthorized: saved.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false',
+        passwordSet: Boolean(saved.DATABASE_PASSWORD),
+      },
+      redis: {
+        enabled: saved.REDIS_ENABLED === 'true',
+        builtIn: saved.REDIS_BUILTIN === 'true',
+        host: saved.REDIS_HOST || '',
+        port: saved.REDIS_PORT || '',
+        passwordSet: Boolean(saved.REDIS_PASSWORD),
+      },
+      queue: { enabled: saved.QUEUE_ENABLED === 'true' },
+      storage: {
+        type: saved.STORAGE_TYPE === 's3' ? 's3' : 'local',
+        builtIn: saved.MINIO_BUILTIN === 'true',
+        localPath: saved.STORAGE_LOCAL_PATH || '',
+        s3Bucket: saved.S3_BUCKET || '',
+        s3Region: saved.S3_REGION || '',
+        s3Endpoint: saved.S3_ENDPOINT || '',
+        s3CredentialsSet: Boolean(saved.S3_ACCESS_KEY_ID && saved.S3_SECRET_ACCESS_KEY),
+      },
+      engine: {
+        headless: saved.PUPPETEER_HEADLESS !== 'false',
+        sessionDataPath: saved.SESSION_DATA_PATH || '',
+        browserArgs: saved.PUPPETEER_ARGS || '',
+      },
+    };
+  }
+
   @Put('config')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Save infrastructure configuration to .env file' })
   @ApiResponse({ status: 200, description: 'Configuration saved' })
   @ApiBody({ description: 'Configuration to save' })
   saveConfig(@Body() config: SaveConfigDto): { message: string; saved: boolean; envPath: string; profiles: string[] } {
     try {
-      // Build .env content from config
-      const envLines: string[] = [];
       const profiles: string[] = [];
 
-      // Header
-      envLines.push('# OpenWA Configuration');
-      envLines.push(`# Generated at ${new Date().toISOString()}`);
-      envLines.push('');
+      // Merge into the existing saved config rather than rebuilding from scratch, so a
+      // partial payload (the dashboard only sends the sections it renders) cannot wipe
+      // keys it didn't include (#226).
+      const envPath = path.resolve(process.cwd(), 'data', '.env.generated');
+      const existing: Record<string, string> = fs.existsSync(envPath)
+        ? dotenv.parse(fs.readFileSync(envPath, 'utf8'))
+        : {};
+      const updates: Record<string, string> = {};
+      // Keys to remove from the merged result — used to drop stale settings when the
+      // user switches mode (postgres->sqlite, s3->local) so a reload never sees the new
+      // mode alongside leftover keys from the old one.
+      const staleKeys = new Set<string>();
 
-      // Database
+      // Secret values are never echoed back to the form, so an empty submission means
+      // "unchanged" — keep whatever is already stored instead of blanking it.
+      const setSecret = (key: string, value: string | undefined): void => {
+        if (value) updates[key] = value;
+      };
+
+      // Database. NOTE: these keys must match what src/config/configuration.ts reads.
       if (config.database) {
-        envLines.push('# Database');
-        envLines.push(`DATABASE_TYPE=${config.database.type || 'sqlite'}`);
-        envLines.push(`POSTGRES_BUILTIN=${config.database.builtIn ? 'true' : 'false'}`);
+        updates.DATABASE_TYPE = config.database.type || 'sqlite';
+        updates.POSTGRES_BUILTIN = config.database.builtIn ? 'true' : 'false';
         if (config.database.type === 'postgres') {
           if (config.database.builtIn) {
             // Built-in PostgreSQL - use container name as host
-            envLines.push('DATABASE_HOST=postgres');
-            envLines.push('DATABASE_PORT=5432');
-            envLines.push('DATABASE_USERNAME=openwa');
-            envLines.push('DATABASE_PASSWORD=openwa');
-            envLines.push('DATABASE_NAME=openwa');
+            updates.DATABASE_HOST = 'postgres';
+            updates.DATABASE_PORT = '5432';
+            updates.DATABASE_USERNAME = 'openwa';
+            updates.DATABASE_PASSWORD = 'openwa';
+            updates.DATABASE_NAME = 'openwa';
             profiles.push('postgres');
           } else {
             // External PostgreSQL
-            envLines.push(`DATABASE_HOST=${config.database.host || 'localhost'}`);
-            envLines.push(`DATABASE_PORT=${config.database.port || '5432'}`);
-            envLines.push(`DATABASE_USERNAME=${config.database.username || 'postgres'}`);
-            envLines.push(`DATABASE_PASSWORD=${config.database.password || ''}`);
-            envLines.push(`DATABASE_NAME=${config.database.database || 'openwa'}`);
+            updates.DATABASE_HOST = config.database.host || 'localhost';
+            updates.DATABASE_PORT = config.database.port || '5432';
+            updates.DATABASE_USERNAME = config.database.username || 'postgres';
+            setSecret('DATABASE_PASSWORD', config.database.password);
+            updates.DATABASE_NAME = config.database.database || 'openwa';
           }
-          envLines.push(`DATABASE_POOL_SIZE=${config.database.poolSize || 10}`);
-          envLines.push(`DATABASE_SSL=${config.database.sslEnabled ? 'true' : 'false'}`);
+          updates.DATABASE_POOL_SIZE = String(config.database.poolSize || 10);
+          updates.DATABASE_SSL = config.database.sslEnabled ? 'true' : 'false';
+          if (config.database.sslEnabled) {
+            // Default to certificate verification; only relax it when the operator opts out
+            // (managed Postgres with self-signed certs: Supabase, Heroku, Render, Railway).
+            updates.DATABASE_SSL_REJECT_UNAUTHORIZED =
+              config.database.sslRejectUnauthorized === false ? 'false' : 'true';
+          }
+        } else {
+          // Switching to sqlite: drop stale postgres connection keys.
+          for (const k of [
+            'DATABASE_HOST',
+            'DATABASE_PORT',
+            'DATABASE_USERNAME',
+            'DATABASE_PASSWORD',
+            'DATABASE_NAME',
+            'DATABASE_POOL_SIZE',
+            'DATABASE_SSL',
+            'DATABASE_SSL_REJECT_UNAUTHORIZED',
+          ]) {
+            staleKeys.add(k);
+          }
         }
-        envLines.push('');
       }
 
       // Redis / Queue
-      envLines.push('# Redis / Queue System');
-      envLines.push(`REDIS_ENABLED=${config.redis?.enabled ? 'true' : 'false'}`);
-      envLines.push(`REDIS_BUILTIN=${config.redis?.builtIn ? 'true' : 'false'}`);
-      envLines.push(`QUEUE_ENABLED=${config.queue?.enabled ? 'true' : 'false'}`);
-      if (config.redis?.enabled) {
-        if (config.redis.builtIn) {
-          // Built-in Redis - use container name as host
-          envLines.push('REDIS_HOST=redis');
-          envLines.push('REDIS_PORT=6379');
-          profiles.push('redis');
-        } else {
-          // External Redis
-          envLines.push(`REDIS_HOST=${config.redis.host || 'localhost'}`);
-          envLines.push(`REDIS_PORT=${config.redis.port || '6379'}`);
-          if (config.redis.password) {
-            envLines.push(`REDIS_PASSWORD=${config.redis.password}`);
+      if (config.redis || config.queue) {
+        updates.REDIS_ENABLED = config.redis?.enabled ? 'true' : 'false';
+        updates.REDIS_BUILTIN = config.redis?.builtIn ? 'true' : 'false';
+        updates.QUEUE_ENABLED = config.queue?.enabled ? 'true' : 'false';
+        if (config.redis?.enabled) {
+          if (config.redis.builtIn) {
+            // Built-in Redis - use container name as host
+            updates.REDIS_HOST = 'redis';
+            updates.REDIS_PORT = '6379';
+            profiles.push('redis');
+          } else {
+            // External Redis
+            updates.REDIS_HOST = config.redis.host || 'localhost';
+            updates.REDIS_PORT = config.redis.port || '6379';
+            setSecret('REDIS_PASSWORD', config.redis.password);
           }
         }
       }
-      envLines.push('');
 
-      // Storage
+      // Storage. NOTE: STORAGE_LOCAL_PATH / S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY are
+      // the names configuration.ts reads (previously saved as STORAGE_PATH / S3_*_KEY and
+      // silently ignored — #226).
       if (config.storage) {
-        envLines.push('# Storage');
-        envLines.push(`STORAGE_TYPE=${config.storage.type || 'local'}`);
-        envLines.push(`MINIO_BUILTIN=${config.storage.builtIn ? 'true' : 'false'}`);
+        updates.STORAGE_TYPE = config.storage.type || 'local';
+        updates.MINIO_BUILTIN = config.storage.builtIn ? 'true' : 'false';
         if (config.storage.type === 'local') {
-          envLines.push(`STORAGE_PATH=${config.storage.localPath || './uploads'}`);
+          updates.STORAGE_LOCAL_PATH = config.storage.localPath || './data/media';
+          // Switching to local: drop stale S3 keys.
+          for (const k of ['S3_ENDPOINT', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'S3_BUCKET', 'S3_REGION']) {
+            staleKeys.add(k);
+          }
         } else if (config.storage.type === 's3') {
+          staleKeys.add('STORAGE_LOCAL_PATH');
           if (config.storage.builtIn) {
             // Built-in MinIO - use container name as endpoint
-            envLines.push('S3_ENDPOINT=http://minio:9000');
-            envLines.push('S3_ACCESS_KEY=minioadmin');
-            envLines.push('S3_SECRET_KEY=minioadmin');
-            envLines.push('S3_BUCKET=openwa');
-            envLines.push('S3_REGION=us-east-1');
+            updates.S3_ENDPOINT = 'http://minio:9000';
+            updates.S3_ACCESS_KEY_ID = 'minioadmin';
+            updates.S3_SECRET_ACCESS_KEY = 'minioadmin';
+            updates.S3_BUCKET = 'openwa';
+            updates.S3_REGION = 'us-east-1';
             profiles.push('minio');
           } else {
             // External S3/MinIO
-            envLines.push(`S3_BUCKET=${config.storage.s3Bucket || ''}`);
-            envLines.push(`S3_REGION=${config.storage.s3Region || 'ap-southeast-1'}`);
-            envLines.push(`S3_ACCESS_KEY=${config.storage.s3AccessKey || ''}`);
-            envLines.push(`S3_SECRET_KEY=${config.storage.s3SecretKey || ''}`);
+            updates.S3_BUCKET = config.storage.s3Bucket || '';
+            updates.S3_REGION = config.storage.s3Region || 'ap-southeast-1';
+            setSecret('S3_ACCESS_KEY_ID', config.storage.s3AccessKey);
+            setSecret('S3_SECRET_ACCESS_KEY', config.storage.s3SecretKey);
             if (config.storage.s3Endpoint) {
-              envLines.push(`S3_ENDPOINT=${config.storage.s3Endpoint}`);
+              updates.S3_ENDPOINT = config.storage.s3Endpoint;
             }
           }
         }
-        envLines.push('');
       }
 
-      // Engine
+      // Engine. NOTE: PUPPETEER_HEADLESS / SESSION_DATA_PATH / PUPPETEER_ARGS are the names
+      // configuration.ts reads (previously saved as ENGINE_* and silently ignored — #226).
       if (config.engine) {
-        envLines.push('# WhatsApp Engine');
-        envLines.push(`ENGINE_HEADLESS=${config.engine.headless !== false ? 'true' : 'false'}`);
-        envLines.push(`ENGINE_SESSION_PATH=${config.engine.sessionDataPath || './data/sessions'}`);
-        envLines.push(`ENGINE_BROWSER_ARGS=${config.engine.browserArgs || '--no-sandbox --disable-gpu'}`);
-        envLines.push('');
+        updates.PUPPETEER_HEADLESS = config.engine.headless !== false ? 'true' : 'false';
+        updates.SESSION_DATA_PATH = config.engine.sessionDataPath || './data/sessions';
+        updates.PUPPETEER_ARGS = config.engine.browserArgs || '--no-sandbox --disable-gpu';
       }
 
-      // Docker Profiles (for reference)
-      envLines.push('# Docker Profiles (auto-generated)');
-      envLines.push(`# Required profiles: ${profiles.length > 0 ? profiles.join(', ') : 'none'}`);
-      envLines.push('');
+      // Existing values are the base; this payload's values win (secrets handled above).
+      const merged: Record<string, string> = { ...existing, ...updates };
+      // Drop keys made obsolete by a mode switch (postgres->sqlite, s3->local).
+      for (const k of staleKeys) {
+        delete merged[k];
+      }
+      const body = Object.keys(merged)
+        .sort()
+        .map(key => `${key}=${merged[key]}`);
+      const contents = [
+        '# OpenWA Configuration',
+        `# Generated at ${new Date().toISOString()}`,
+        '# Managed via Dashboard > Infrastructure. Values in process env or project .env take precedence.',
+        '',
+        ...body,
+        '',
+      ].join('\n');
 
-      // Write to .env file in data/ directory so it persists across container restarts
-      const envPath = path.resolve(process.cwd(), 'data', '.env.generated');
-      fs.writeFileSync(envPath, envLines.join('\n'), 'utf8');
+      // Write to data/ so it persists across container restarts.
+      fs.writeFileSync(envPath, contents, 'utf8');
       this.logger.log('Configuration saved', { envPath });
 
       const profileMsg = profiles.length > 0 ? ` Docker profiles required: ${profiles.join(', ')}.` : '';
@@ -335,6 +465,7 @@ export class InfraController {
     }
   }
   @Post('restart')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Request server restart with Docker orchestration' })
   @ApiResponse({ status: 200, description: 'Server will restart with new profiles' })
   async requestRestart(@Body() body?: { profiles?: string[]; profilesToRemove?: string[] }): Promise<{
@@ -400,8 +531,9 @@ export class InfraController {
       }
     }
 
-    // Schedule graceful shutdown after delay to allow response and container orchestration
-    void this.shutdownService.shutdown(3000);
+    // Schedule graceful shutdown after the configurable bounded grace (SHUTDOWN_DELAY_MS,
+    // default 3s) — readiness reports 503 during the window so traffic drains first.
+    void this.shutdownService.shutdown();
 
     // Calculate estimated time - base 15s + additional for each service (increased for reliability)
     let estimatedTime = 15;
@@ -436,6 +568,7 @@ export class InfraController {
   }
 
   @Get('export-data')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Export all data from Data DB for migration' })
   @ApiResponse({ status: 200, description: 'Exported data as JSON' })
   async exportData(): Promise<{
@@ -483,6 +616,7 @@ export class InfraController {
   }
 
   @Post('import-data')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Import data to Data DB (replaces existing data)' })
   @ApiBody({
     description: 'Exported data from export-data endpoint',
@@ -668,6 +802,7 @@ export class InfraController {
   // ============================================================================
 
   @Get('storage/files/count')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get file count in current storage' })
   @ApiResponse({ status: 200, description: 'File count and size' })
   async getStorageFileCount(): Promise<{
@@ -686,6 +821,7 @@ export class InfraController {
   }
 
   @Get('storage/export')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Export all storage files as tar.gz' })
   @ApiResponse({ status: 200, description: 'Tar.gz archive stream' })
   async exportStorage(): Promise<{ message: string; download: string }> {
@@ -709,6 +845,7 @@ export class InfraController {
   }
 
   @Post('storage/import')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Import storage files from tar.gz' })
   @ApiBody({ description: 'Path to tar.gz file to import' })
   @ApiResponse({ status: 200, description: 'Import result' })
@@ -717,8 +854,15 @@ export class InfraController {
   ): Promise<{ imported: boolean; count: number; storageType: string }> {
     const { filePath } = body;
 
+    // `filePath` is fully caller-controlled. Restrict it to the app's data
+    // directory so it cannot point at arbitrary files on the host.
+    const dataDir = path.join(process.cwd(), 'data');
+    if (!filePath || !isPathWithin(dataDir, filePath)) {
+      throw new BadRequestException('filePath must reference a file inside the data directory');
+    }
+
     if (!fs.existsSync(filePath)) {
-      throw new Error(`File not found: ${filePath}`);
+      throw new BadRequestException(`File not found: ${filePath}`);
     }
 
     const readStream = fs.createReadStream(filePath);

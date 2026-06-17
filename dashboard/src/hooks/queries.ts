@@ -2,11 +2,13 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   sessionApi,
   webhookApi,
+  templateApi,
   apiKeyApi,
   auditApi,
   infraApi,
   pluginsApi,
   type Webhook,
+  type TemplatePayload,
 } from '../services/api';
 
 // ── Query Keys ────────────────────────────────────────────────────────
@@ -16,6 +18,7 @@ export const queryKeys = {
   sessionStats: ['sessions', 'stats'] as const,
   sessionGroups: (sessionId: string) => ['sessions', sessionId, 'groups'] as const,
   webhooks: ['webhooks'] as const,
+  templates: (sessionId: string) => ['sessions', sessionId, 'templates'] as const,
   apiKeys: ['apiKeys'] as const,
   logs: (params: { severity?: string; page: number; limit: number }) =>
     ['logs', params] as const,
@@ -49,38 +52,6 @@ export function useSessionGroupsQuery(sessionId: string, enabled: boolean) {
     queryFn: () => sessionApi.getGroups(sessionId),
     enabled: enabled && !!sessionId,
     staleTime: 60_000,
-  });
-}
-
-export function useCreateSessionMutation() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (name: string) => sessionApi.create(name),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.sessionStats });
-    },
-  });
-}
-
-export function useDeleteSessionMutation() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (id: string) => sessionApi.delete(id),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.sessionStats });
-    },
-  });
-}
-
-export function useStartSessionMutation() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (id: string) => sessionApi.start(id),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
-    },
   });
 }
 
@@ -133,6 +104,50 @@ export function useDeleteWebhookMutation() {
       webhookApi.delete(params.sessionId, params.id),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.webhooks });
+    },
+  });
+}
+
+// ── Template Queries ─────────────────────────────────────────────────────────
+
+export function useTemplatesQuery(sessionId: string, enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.templates(sessionId),
+    queryFn: () => templateApi.list(sessionId),
+    enabled: enabled && !!sessionId,
+    staleTime: 30_000,
+  });
+}
+
+export function useCreateTemplateMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { sessionId: string; data: TemplatePayload }) =>
+      templateApi.create(params.sessionId, params.data),
+    onSuccess: (_template, params) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.templates(params.sessionId) });
+    },
+  });
+}
+
+export function useUpdateTemplateMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { sessionId: string; id: string; data: Partial<TemplatePayload> }) =>
+      templateApi.update(params.sessionId, params.id, params.data),
+    onSuccess: (_template, params) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.templates(params.sessionId) });
+    },
+  });
+}
+
+export function useDeleteTemplateMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { sessionId: string; id: string }) =>
+      templateApi.delete(params.sessionId, params.id),
+    onSuccess: (_template, params) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.templates(params.sessionId) });
     },
   });
 }
@@ -199,6 +214,14 @@ export function useInfraStatusQuery() {
   return useQuery({
     queryKey: queryKeys.infraStatus,
     queryFn: infraApi.getStatus,
+    staleTime: 30_000,
+  });
+}
+
+export function useInfraConfigQuery() {
+  return useQuery({
+    queryKey: ['infra', 'config'],
+    queryFn: infraApi.getConfig,
     staleTime: 30_000,
   });
 }

@@ -17,7 +17,7 @@ import {
   Zap,
   X,
 } from 'lucide-react';
-import { pluginsApi } from '../services/api';
+import { pluginsApi, infraApi } from '../services/api';
 import type { Plugin } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import {
@@ -118,6 +118,16 @@ export default function Plugins() {
   const handleSaveConfig = async () => {
     setSavingConfig(true);
     try {
+      // Persist the engine section to the backend (.env.generated via PUT /infra/config).
+      // The engine `type` isn't a savable field (only whatsapp-web.js exists); the backend
+      // maps these to PUPPETEER_HEADLESS / SESSION_DATA_PATH / PUPPETEER_ARGS.
+      await infraApi.saveConfig({
+        engine: {
+          headless: engineConfig.headless,
+          sessionDataPath: engineConfig.sessionDataPath,
+          browserArgs: engineConfig.browserArgs,
+        },
+      });
       toast.success(t('plugins.toasts.savedTitle'), t('plugins.toasts.savedDesc'));
       setShowConfigModal(false);
     } catch (err) {
@@ -168,7 +178,10 @@ export default function Plugins() {
             </div>
             <div>
               <h3 className="engine-title">{t('plugins.engineCard')}</h3>
-              <span className="engine-name">{currentEngine}</span>
+              <span className="engine-name">
+                {currentEngine}
+                {activeEngine?.library && ` · ${activeEngine.library.name} ${activeEngine.library.version}`}
+              </span>
             </div>
           </div>
           <span className="status-badge connected">{t('plugins.running')}</span>
@@ -178,14 +191,11 @@ export default function Plugins() {
           <div className="engine-features">
             <p className="features-label">{t('plugins.supportedFeatures')}</p>
             <div className="features-list">
-              {activeEngine.features.slice(0, 8).map(feature => (
+              {activeEngine.features.map(feature => (
                 <span key={feature} className="feature-tag">
-                  {feature}
+                  {feature.replace(/-/g, ' ')}
                 </span>
               ))}
-              {activeEngine.features.length > 8 && (
-                <span className="feature-more">{t('plugins.more', { count: activeEngine.features.length - 8 })}</span>
-              )}
             </div>
           </div>
         )}

@@ -11,6 +11,7 @@ import {
   Webhook as WebhookIcon,
   Check,
   AlertTriangle,
+  AlertCircle,
 } from 'lucide-react';
 import { webhookApi, type Webhook } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
@@ -25,12 +26,21 @@ import {
 import { PageHeader } from '../components/PageHeader';
 import './Webhooks.css';
 
+// Must stay aligned with the backend WEBHOOK_EVENTS: the API now rejects unknown
+// event names, so offering e.g. the never-emitted 'session.connected' would 400 on save.
 const availableEventNames = [
   'message.received',
   'message.sent',
-  'session.connected',
-  'session.disconnected',
+  'message.ack',
+  'message.failed',
+  'message.revoked',
+  'session.status',
   'session.qr',
+  'session.authenticated',
+  'session.disconnected',
+  'group.join',
+  'group.leave',
+  'group.update',
   '*',
 ] as const;
 
@@ -38,7 +48,7 @@ export function Webhooks() {
   const { t } = useTranslation();
   useDocumentTitle(t('webhooks.title'));
   const { canWrite } = useRole();
-  const { data: webhooks = [], isLoading: loadingWebhooks } = useWebhooksQuery();
+  const { data: webhooks = [], isLoading: loadingWebhooks, isError: webhooksError } = useWebhooksQuery();
   const { data: sessions = [] } = useSessionsQuery();
   const loading = loadingWebhooks;
   const createMutation = useCreateWebhookMutation();
@@ -211,6 +221,13 @@ export function Webhooks() {
         }
       />
 
+      {webhooksError && (
+        <div className="error-banner" role="alert">
+          <AlertCircle size={20} />
+          <span className="error-banner-text">{t('dashboard.loadError')}</span>
+        </div>
+      )}
+
       {showCreateModal && (
         <div className="modal-overlay" onClick={() => setShowCreateModal(false)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
@@ -360,71 +377,78 @@ export function Webhooks() {
       )}
 
       <div className="webhooks-content">
-        <div className="webhooks-table-container">
-          <div className="webhooks-table">
-            <div className="table-row header">
-              <span>{t('webhooks.columns.url')}</span>
-              <span>{t('webhooks.columns.events')}</span>
-              <span>{t('webhooks.columns.session')}</span>
-              <span>{t('webhooks.columns.status')}</span>
-              <span>{t('webhooks.columns.actions')}</span>
+        <div className="webhooks-list-container">
+          {webhooks.length === 0 ? (
+            <div className="empty-table-state">
+              <WebhookIcon size={48} strokeWidth={1} />
+              <h3>{t('webhooks.empty.title')}</h3>
+              <p>{t('webhooks.empty.description')}</p>
             </div>
-            {webhooks.length === 0 ? (
-              <div className="empty-table-state">
-                <WebhookIcon size={48} strokeWidth={1} />
-                <h3>{t('webhooks.empty.title')}</h3>
-                <p>{t('webhooks.empty.description')}</p>
-              </div>
-            ) : (
-              webhooks.map(webhook => (
-                <div key={webhook.id} className="table-row">
-                  <span className="url-cell">
-                    <code>{webhook.url}</code>
-                    <ExternalLink size={14} />
-                  </span>
-                  <span className="events-cell">
-                    {webhook.events.map((event: string) => (
-                      <span key={event} className="event-tag">
-                        {event}
-                      </span>
-                    ))}
-                  </span>
-                  <span>
-                    {sessions.find(s => s.id === webhook.sessionId)?.name || webhook.sessionId.substring(0, 8)}
-                  </span>
-                  <span>
-                    <span className={`status-badge ${webhook.active ? 'active' : 'inactive'}`}>
-                      {webhook.active ? t('common.active') : t('common.inactive')}
-                    </span>
-                  </span>
-                  <span className="actions-cell">
-                    <button
-                      className="icon-btn"
-                      title={t('webhooks.actions.test')}
-                      onClick={() => handleTest(webhook.sessionId, webhook.id)}
-                      disabled={testingId === webhook.id}
-                    >
-                      {testingId === webhook.id ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
-                    </button>
-                    {canWrite && (
-                      <>
-                        <button className="icon-btn" title={t('webhooks.actions.edit')} onClick={() => openEdit(webhook)}>
-                          <Edit size={16} />
-                        </button>
+          ) : (
+            <div className="webhooks-card-list">
+              {webhooks.map(webhook => {
+                const sessionName = sessions.find(s => s.id === webhook.sessionId)?.name || webhook.sessionId.substring(0, 12);
+                return (
+                  <div key={webhook.id} className="webhook-card">
+                    <div className="webhook-card-header">
+                      <div className="webhook-url-row">
+                        <ExternalLink size={16} className="webhook-url-icon" />
+                        <code className="webhook-url">{webhook.url}</code>
+                      </div>
+                      <div className="webhook-card-actions">
                         <button
-                          className="icon-btn danger"
-                          title={t('webhooks.actions.delete')}
-                          onClick={() => confirmDelete(webhook.sessionId, webhook.id, webhook.url)}
+                          className="icon-btn"
+                          title={t('webhooks.actions.test')}
+                          onClick={() => handleTest(webhook.sessionId, webhook.id)}
+                          disabled={testingId === webhook.id}
                         >
-                          <Trash2 size={16} />
+                          {testingId === webhook.id ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
                         </button>
-                      </>
-                    )}
-                  </span>
-                </div>
-              ))
-            )}
-          </div>
+                        {canWrite && (
+                          <>
+                            <button className="icon-btn" title={t('webhooks.actions.edit')} onClick={() => openEdit(webhook)}>
+                              <Edit size={16} />
+                            </button>
+                            <button
+                              className="icon-btn danger"
+                              title={t('webhooks.actions.delete')}
+                              onClick={() => confirmDelete(webhook.sessionId, webhook.id, webhook.url)}
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                    <div className="webhook-card-body">
+                      <div className="webhook-meta">
+                        <div className="webhook-meta-item">
+                          <span className="webhook-meta-label">{t('webhooks.columns.session')}</span>
+                          <span className="webhook-meta-value">{sessionName}</span>
+                        </div>
+                        <div className="webhook-meta-item">
+                          <span className="webhook-meta-label">{t('webhooks.columns.status')}</span>
+                          <span className={`status-badge ${webhook.active ? 'active' : 'inactive'}`}>
+                            {webhook.active ? t('common.active') : t('common.inactive')}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="webhook-events">
+                        <span className="webhook-meta-label">{t('webhooks.columns.events')}</span>
+                        <div className="events-cell">
+                          {webhook.events.map((event: string) => (
+                            <span key={event} className="event-tag">
+                              {event}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         <div className="events-reference">

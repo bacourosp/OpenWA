@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Download, Search, Filter, Loader2, FileText } from 'lucide-react';
+import { Download, Search, Filter, Loader2, FileText, AlertCircle } from 'lucide-react';
 import type { AuditLog } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { useLogsQuery } from '../hooks/queries';
@@ -16,7 +16,7 @@ export function Logs() {
   const limit = 20;
 
   const severityParam = severityFilter !== 'all' ? severityFilter : undefined;
-  const { data, isLoading: loading } = useLogsQuery({ severity: severityParam, page, limit });
+  const { data, isLoading: loading, isError: logsError } = useLogsQuery({ severity: severityParam, page, limit });
   const logs: AuditLog[] = data?.data ?? [];
   const total: number = data?.total ?? 0;
 
@@ -30,6 +30,52 @@ export function Logs() {
   const totalPages = Math.ceil(total / limit);
 
   const formatTimestamp = (date: string) => new Date(date).toLocaleString();
+
+  // Export the currently loaded (and filtered) logs to a CSV download. Client-side only —
+  // it exports what the page already has, not the whole audit history.
+  const handleExportCsv = () => {
+    if (filteredLogs.length === 0) return;
+    const headers = [
+      'timestamp',
+      'action',
+      'severity',
+      'session',
+      'apiKey',
+      'ip',
+      'method',
+      'path',
+      'statusCode',
+      'errorMessage',
+    ];
+    const escape = (value: unknown): string => {
+      const s = value === undefined || value === null ? '' : String(value);
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const rows = filteredLogs.map(log =>
+      [
+        log.createdAt,
+        log.action,
+        log.severity,
+        log.sessionName || log.sessionId || '',
+        log.apiKeyName || log.apiKeyId || '',
+        log.ipAddress,
+        log.method,
+        log.path,
+        log.statusCode,
+        log.errorMessage,
+      ]
+        .map(escape)
+        .join(','),
+    );
+    const csv = [headers.join(','), ...rows].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `openwa-logs-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   if (loading && logs.length === 0) {
     return (
@@ -48,12 +94,19 @@ export function Logs() {
         title={t('logs.title')}
         subtitle={t('logs.subtitle')}
         actions={
-          <button className="btn-secondary">
+          <button className="btn-secondary" onClick={handleExportCsv} disabled={filteredLogs.length === 0}>
             <Download size={18} />
             {t('logs.exportCsv')}
           </button>
         }
       />
+
+      {logsError && (
+        <div className="error-banner" role="alert">
+          <AlertCircle size={20} />
+          <span className="error-banner-text">{t('dashboard.loadError')}</span>
+        </div>
+      )}
 
       <div className="filters-bar">
         <div className="search-input">

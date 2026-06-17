@@ -1,9 +1,20 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
-import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import { SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { ShutdownService } from './common/services/shutdown.service';
+import { LoggerService, LogLevel, createLogger } from './common/services/logger.service';
+import { createSwaggerConfig } from './config/swagger.config';
+import {
+  resolveCorsPolicy,
+  isSwaggerEnabled,
+  resolveBodyLimit,
+  assertNoDefaultSecretsInProduction,
+} from './config/bootstrap-security';
+import { BullBoardAuthMiddleware } from './common/security/bull-board-auth.middleware';
+import { AuthService } from './modules/auth/auth.service';
+import { Request, Response, NextFunction, json, urlencoded } from 'express';
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -65,7 +76,39 @@ STORAGE_PATH=./data/media
 }
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // Apply the operator-configured log verbosity (LOG_LEVEL) before anything logs. Unset/invalid → INFO.
+  const requestedLevel = process.env.LOG_LEVEL?.trim().toLowerCase();
+  if (requestedLevel && (Object.values(LogLevel) as string[]).includes(requestedLevel)) {
+    LoggerService.setLogLevel(requestedLevel as LogLevel);
+  }
+
+  // Backstop for promise rejections that escaped a local handler (e.g. a fire-and-forget engine-event
+  // dispatch). Node terminates the process on an unhandled rejection by default; for a long-running
+  // self-hosted gateway we'd rather log it and stay up than let one stray rejection kill all sessions.
+  const bootstrapLogger = createLogger('Bootstrap');
+  process.on('unhandledRejection', (reason: unknown) => {
+    bootstrapLogger.error('Unhandled promise rejection', reason instanceof Error ? reason.stack : String(reason));
+  });
+
+  // Fail fast: never start production with default/placeholder secrets.
+  assertNoDefaultSecretsInProduction({
+    nodeEnv: process.env.NODE_ENV,
+    databaseType: process.env.DATABASE_TYPE,
+    databasePassword: process.env.DATABASE_PASSWORD,
+    storageType: process.env.STORAGE_TYPE,
+    s3AccessKey: process.env.S3_ACCESS_KEY,
+    s3SecretKey: process.env.S3_SECRET_KEY,
+    apiMasterKey: process.env.API_MASTER_KEY,
+  });
+
+  // Disable Nest's default body parser so we can set an explicit size cap below.
+  const app = await NestFactory.create(AppModule, { bodyParser: false });
+
+  // Cap request body size (DoS hardening). Media sends carry base64 in the JSON body,
+  // so the default is generous; tune with BODY_SIZE_LIMIT.
+  const bodyLimit = resolveBodyLimit(process.env.BODY_SIZE_LIMIT);
+  app.use(json({ limit: bodyLimit }));
+  app.use(urlencoded({ extended: true, limit: bodyLimit }));
 
   // Enable shutdown hooks for graceful shutdown
   app.enableShutdownHooks();
@@ -76,7 +119,14 @@ async function bootstrap() {
     await app.close();
   });
 
-  // Enhanced Security Headers (Phase 3 Security Audit)
+  // On a termination signal, flip readiness to 503 immediately so the load
+  // balancer/orchestrator stops routing new traffic. This only sets a flag — NestJS's
+  // own shutdown hooks (enabled above) still perform the actual app.close()/teardown.
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    process.on(signal, () => shutdownService.markShuttingDown());
+  }
+
+  // Enhanced Security Headers
   app.use(
     helmet({
       contentSecurityPolicy: {
@@ -103,21 +153,31 @@ async function bootstrap() {
     }),
   );
 
-  // CORS Configuration (Phase 3 Security Audit)
-  const allowedOrigins = process.env.CORS_ORIGINS?.split(',').map(o => o.trim()) || ['*'];
+  // CORS Configuration (#221 hardening)
+  const corsPolicy = resolveCorsPolicy(process.env.CORS_ORIGINS, process.env.NODE_ENV);
+  if (process.env.NODE_ENV === 'production' && corsPolicy.origins.length === 0 && !corsPolicy.allowAnyOrigin) {
+    console.warn(
+      '[Bootstrap] No explicit CORS_ORIGINS in production (wildcard "*" is refused): cross-origin browser ' +
+        'requests will be blocked. Set CORS_ORIGINS to your dashboard origin(s).',
+    );
+  }
   app.enableCors({
     origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
       // Allow requests with no origin (mobile apps, Postman, server-to-server)
       if (!origin) return callback(null, true);
 
-      // Check if wildcard or origin matches
-      if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+      if (corsPolicy.allowAnyOrigin || corsPolicy.origins.includes(origin)) {
         callback(null, true);
       } else {
-        callback(new Error('Not allowed by CORS'));
+        // Deny WITHOUT throwing. Throwing here surfaced as a 500 Internal Server Error (#250).
+        // Returning false simply omits the CORS headers: the browser blocks a true cross-origin
+        // request itself (correct), while same-origin requests — e.g. the bundled dashboard served
+        // through the proxy, which the browser never subjects to CORS — keep working. A genuine
+        // cross-origin dashboard still needs its origin in CORS_ORIGINS.
+        callback(null, false);
       }
     },
-    credentials: true,
+    credentials: corsPolicy.credentials,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'X-API-Key', 'Authorization', 'X-Request-ID'],
     exposedHeaders: ['X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
@@ -140,24 +200,21 @@ async function bootstrap() {
     }),
   );
 
-  // Swagger documentation
-  const config = new DocumentBuilder()
-    .setTitle('OpenWA API')
-    .setDescription('Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API')
-    .setVersion('0.1.6')
-    .addApiKey({ type: 'apiKey', name: 'X-API-Key', in: 'header' }, 'X-API-Key')
-    .addTag('sessions', 'WhatsApp session management')
-    .addTag('messages', 'Send and manage messages')
-    .addTag('webhooks', 'Webhook configuration')
-    .addTag('contacts', 'Contact management')
-    .addTag('groups', 'Group management')
-    .addTag('labels', 'Label management (WhatsApp Business)')
-    .addTag('channels', 'Channel/Newsletter management')
-    .addTag('health', 'Health check endpoints')
-    .build();
+  // Swagger documentation (gated by ENABLE_SWAGGER; default on)
+  if (isSwaggerEnabled(process.env.ENABLE_SWAGGER)) {
+    const config = createSwaggerConfig();
+    const document = SwaggerModule.createDocument(app, config);
+    SwaggerModule.setup('api/docs', app, document);
+  }
 
-  const document = SwaggerModule.createDocument(app, config);
-  SwaggerModule.setup('api/docs', app, document);
+  // Protect the Bull Board queue UI (/api/admin/queues). It is mounted by
+  // @bull-board/nestjs as raw Express middleware that the global ApiKeyGuard
+  // does not cover; registering this before app.listen() ensures it runs ahead
+  // of the Bull Board router. Requires a valid ADMIN API key.
+  const bullBoardAuth = new BullBoardAuthMiddleware(app.get(AuthService));
+  app.use('/api/admin/queues', (req: Request, res: Response, next: NextFunction) => {
+    void bullBoardAuth.use(req, res, next);
+  });
 
   const port = process.env.PORT || 2785;
   await app.listen(port);

@@ -24,13 +24,16 @@ timeline
                   : Community tools
                   : Stable release
 
-    section v0.2.0 - Developer Tools
-        Q2 2026 : JavaScript/Node.js SDK
-                : Python SDK
-                : Docs Site
+    section v0.2.0 - i18n, Real-time & Hardening (Released)
+        Jun 2026 : Multi-locale dashboard (i18n)
+                 : Real-time Chats view
+                 : Webhook delivery-state & templates
+                 : Security & container hardening
 
-    section v0.3.0 - Observability
-        Q3 2026 : Prometheus Metrics
+    section v0.3.0 - SDK & Observability
+        Q3 2026 : JavaScript/Node.js & Python SDK
+                : Docs Site
+                : Prometheus Metrics
                 : Grafana Dashboard
 
     section v1.0.0 - Enterprise
@@ -40,14 +43,30 @@ timeline
 
 ### Release Summary
 
-| Version | Focus                       | Status      |
-| ------- | --------------------------- | ----------- |
-| v0.0.1  | MVP - Basic API             | ✅ Released |
-| v0.0.2  | Production Ready            | ✅ Released |
-| v0.1.0  | Initial Stable Release      | ✅ Released |
-| v0.2.0  | SDK & Developer Tools       | 📋 Planned  |
-| v0.3.0  | Performance & Observability | 📋 Planned  |
-| v1.0.0  | Enterprise Ready            | 📋 Planned  |
+| Version | Focus                                                      | Status      |
+| ------- | ---------------------------------------------------------- | ----------- |
+| v0.0.1  | MVP - Basic API                                            | ✅ Released |
+| v0.0.2  | Production Ready                                           | ✅ Released |
+| v0.1.0  | Initial Stable Release                                     | ✅ Released |
+| v0.1.7  | Maintenance & fixes                                        | ✅ Released |
+| v0.1.8  | Maintenance & fixes                                        | ✅ Released |
+| v0.2.0  | i18n, Real-time Chats & Hardening                          | ✅ Released |
+| v0.2.1  | Dashboard split-origin fix                                 | ✅ Released |
+| v0.2.2  | Security hardening (SSRF, secrets, Prometheus metrics)     | ✅ Released |
+| v0.2.3  | Plain-HTTP / LAN dashboard fixes                           | ✅ Released |
+| v0.2.4  | CORS LAN fix, pinnable WA-Web version                      | ✅ Released |
+| v0.2.5  | Pairing-code linking                                       | ✅ Released |
+| v0.2.6  | Chromium hardened-container (read-only) fix                | ✅ Released |
+| v0.2.7  | Typing simulation, delete-chat, engine-agnostic groundwork | ✅ Released |
+| v0.2.8  | Engine decoupling (ack/type/JID), templates, @lid→phone    | ✅ Released |
+| v0.2.9  | Reliability/security/a11y hardening (RBAC, deps, shutdown, retention) | ✅ Released |
+| v0.2.10 | Dashboard/CI follow-ups (MessageTester JID, neutral MessageType, qemu v4) | ✅ Released |
+| v0.3.0  | Deployment simplification (single-port UI, no Traefik) — next breaking release | 📋 Planned  |
+| v1.0.0  | Enterprise Ready (Baileys engine, K8s)                     | 📋 Planned  |
+
+> SDK / docs-site / observability features (Node & Python SDK, Postman collection, Grafana, OpenTelemetry)
+> are delivered **incrementally** in `0.2.x`/`0.3.x` as they're additive — they no longer gate a single
+> version. The version **number** follows SemVer (see §15.2), not the theme.
 
 ### Risk Buffer
 
@@ -82,10 +101,26 @@ Examples:
 0.0.2 - Production Ready (Multi-session, Dashboard)
 0.1.0 - Initial Stable Release (Full features)
 0.1.1 - Bug fix for QR timeout
-0.2.0 - SDK & Developer Tools
+0.2.0 - i18n, Real-time Chats, Webhook Delivery-state & Hardening
+0.3.0 - SDK & Developer Tools
 1.0.0 - Enterprise Ready
 2.0.0 - Breaking API changes
 ```
+
+### Pre-1.0 policy (we are here)
+
+While the project is on `0.x`, a `1.0.0`/`2.0.0` bump for every breaking change isn't appropriate, so we
+follow the SemVer "major version zero" convention:
+
+- **PATCH (`0.2.x`)** — bug fixes **and** backward-compatible additions (new endpoints, optional fields,
+  new opt-in features). The default for ongoing work.
+- **MINOR (`0.3.0`, `0.4.0`, …)** — **breaking changes** (removed/renamed fields, changed payload
+  semantics, deployment-topology changes). A breaking change does **not** stay in `0.2.x`.
+- Every breaking change ships with a prominent **⚠️ callout + migration note** in the CHANGELOG and the
+  GitHub release, because the version number alone won't fully signal it pre-1.0.
+
+> Note: `0.2.8` shipped one breaking change (webhook `type` neutralization, #270) as a patch — that
+> predates this policy and is documented with a migration note; the policy applies from `0.2.9` onward.
 
 ## 15.3 Phase 1: MVP (Month 1-3)
 
@@ -448,9 +483,11 @@ v0.1.0 Release Package:
     └── Release automation
 ```
 
-## 15.6 Future Roadmap (v0.2.0+)
+## 15.6 Future Roadmap (v0.3.0+)
 
 > **Note:** Version 0.1.0 is the initial stable release including all features from Phases 1-3.
+> Versions 0.1.7, 0.1.8, 0.2.0, and 0.2.1 have since shipped (see the CHANGELOG); v0.3.0
+> onward is forward-looking.
 
 ```mermaid
 flowchart LR
@@ -462,13 +499,13 @@ flowchart LR
         V002[v0.0.2 - Production Ready<br/>Multi-session & Dashboard]
     end
 
-    subgraph Current["✅ Current Release"]
+    subgraph Stable["✅ Released"]
         V010[v0.1.0 - Initial Stable Release<br/>All Core Features]
+        V020[v0.2.0 - i18n, Real-time Chats,<br/>Webhook Delivery-state & Hardening]
     end
 
     subgraph v0.x["v0.x Series - Enhancements"]
-        V020[v0.2.0 - SDK & Developer Tools]
-        V030[v0.3.0 - Performance & Observability]
+        V030[v0.3.0 - SDK, Developer Tools & Observability]
     end
 
     subgraph v1.x["v1.x Series - Enterprise"]
@@ -476,10 +513,31 @@ flowchart LR
         V11[v1.1.0 - Multi-engine Support]
     end
 
-    Phase1 --> Phase2 --> Current --> v0.x --> v1.x
+    Phase1 --> Phase2 --> Stable --> v0.x --> v1.x
 ```
 
-### v0.2.0 - SDK & Developer Tools
+### v0.2.0 - i18n, Real-time Chats, Webhook Delivery-state & Hardening (Released)
+
+| Feature                          | Priority | Status |
+| -------------------------------- | -------- | ------ |
+| Multi-locale dashboard (i18n)    | P1       | ✅     |
+| Real-time Chats view (WebSocket) | P1       | ✅     |
+| Message templates                | P1       | ✅     |
+| Webhook delivery-state tracking  | P1       | ✅     |
+| Security & API surface hardening | P0       | ✅     |
+| Container / Podman hardening     | P1       | ✅     |
+
+### v0.3.0 — Deployment simplification (next breaking release)
+
+`0.3.0` is the next **breaking** release (per §15.2). Its headline is the deployment simplification:
+serve the dashboard from the API on a single port (`@nestjs/serve-static`) and drop the bundled Traefik
+service (#275, #276), plus moving Puppeteer/browser config out of the neutral engine contract (#265).
+Ships with a migration guide. The remaining engine-pluggability items (#265) and other non-breaking work
+land across `0.2.x`.
+
+#### Incremental themes — SDK, Developer Tools & Observability
+
+Delivered additively whenever ready (so they land in `0.2.x`/`0.3.x` per SemVer, not gated to one version):
 
 | Feature                | Priority | Description                     |
 | ---------------------- | -------- | ------------------------------- |
@@ -490,7 +548,7 @@ flowchart LR
 | Video Tutorials        | P2       | Getting started video series    |
 | Example Projects       | P1       | Real-world integration examples |
 
-### v0.3.0 - Performance & Observability
+**Performance & Observability**
 
 | Feature                | Priority | Description                      |
 | ---------------------- | -------- | -------------------------------- |

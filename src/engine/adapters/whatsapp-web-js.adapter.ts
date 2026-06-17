@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { Client, LocalAuth, MessageMedia } from 'whatsapp-web.js';
+import { Client, LocalAuth, MessageMedia, MessageTypes } from 'whatsapp-web.js';
 import * as qrcode from 'qrcode';
 import * as path from 'path';
 import {
@@ -26,15 +26,67 @@ import {
   Product,
   ProductQueryOptions,
   PaginatedProducts,
+  ChatSummary,
+  ChatState,
+  DeliveryStatus,
+  RevokedMessage,
+  ReactionEvent,
 } from '../interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { assertSafeFetchUrl } from '../../common/security/ssrf-guard';
 import {
   GroupChat,
+  GroupMetadataRaw,
   MessageWithReactions,
   BusinessClient,
   WwjsChannelData,
   GroupCreateResult,
 } from '../types/whatsapp-web-js.types';
+import { buildIncomingMessageBase } from './message-mapper';
+
+/** Default cap on a server-side media download: 50 MiB (overridable via MEDIA_DOWNLOAD_MAX_BYTES). */
+const DEFAULT_MEDIA_MAX_BYTES = 50 * 1024 * 1024;
+/** Default timeout for a server-side media download: 30s (overridable via MEDIA_DOWNLOAD_TIMEOUT_MS). */
+const DEFAULT_MEDIA_TIMEOUT_MS = 30_000;
+
+function positiveIntFromEnv(name: string, fallback: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * Map a whatsapp-web.js MessageAck integer to the neutral DeliveryStatus.
+ * wwebjs: -1 ERROR, 0 PENDING, 1 SERVER (sent), 2 DEVICE (delivered), 3 READ, 4 PLAYED.
+ * PLAYED collapses to `read` (preserving prior behaviour, which treated ack>=3 as read).
+ */
+export function wwebjsAckToDeliveryStatus(ack: number): DeliveryStatus {
+  if (ack < 0) return 'failed';
+  if (ack >= 3) return 'read';
+  if (ack === 2) return 'delivered';
+  if (ack === 1) return 'sent';
+  return 'pending';
+}
+
+/**
+ * Fetch remote media for sending, with an SSRF host guard, a byte cap, and a timeout.
+ * The guard runs BEFORE any network call, so an internal/reserved URL throws `SsrfBlockedError`
+ * and no outbound socket is opened. The byte cap (node-fetch `size`) and `AbortSignal` timeout
+ * bound memory use and hang time. `unsafeMime` is left at its default (false) to preserve the
+ * existing MIME-detection behavior.
+ */
+export async function loadRemoteMedia(url: string): Promise<MessageMedia> {
+  await assertSafeFetchUrl(url);
+  return MessageMedia.fromUrl(url, {
+    reqOptions: {
+      size: positiveIntFromEnv('MEDIA_DOWNLOAD_MAX_BYTES', DEFAULT_MEDIA_MAX_BYTES),
+      signal: AbortSignal.timeout(positiveIntFromEnv('MEDIA_DOWNLOAD_TIMEOUT_MS', DEFAULT_MEDIA_TIMEOUT_MS)),
+      // Never follow redirects: the SSRF guard only validated the original host, so a
+      // followed 3xx could reach an internal target. node-fetch rejects on redirect.
+      redirect: 'error',
+    },
+  });
+}
 
 export interface WhatsAppWebJsConfig {
   sessionId: string;
@@ -42,12 +94,57 @@ export interface WhatsAppWebJsConfig {
   puppeteer?: {
     headless?: boolean;
     args?: string[];
+    executablePath?: string;
   };
   // Phase 3: Proxy per session
   proxy?: {
     url: string;
     type: 'http' | 'https' | 'socks4' | 'socks5';
   };
+}
+
+/**
+ * Optional pin for the WhatsApp Web client version. whatsapp-web.js 1.34.x can get stuck at
+ * "authenticating" (the post-link sync never completes) when the auto-fetched WA-Web version is
+ * incompatible (#251). Set WWEBJS_WEB_VERSION to a known-good version string (browse
+ * https://github.com/wppconnect-team/wa-version) to pin it; WWEBJS_WEB_VERSION_REMOTE_PATH
+ * overrides the URL template (use `{version}` as the placeholder) if you self-host the HTML.
+ * Unset (or `latest`/`off`) keeps whatsapp-web.js's default auto-version behavior.
+ */
+export function resolveWebVersionPin():
+  | { webVersion: string; webVersionCache: { type: 'remote'; remotePath: string } }
+  | undefined {
+  const version = process.env.WWEBJS_WEB_VERSION?.trim();
+  if (!version || version.toLowerCase() === 'off' || version.toLowerCase() === 'latest') {
+    return undefined;
+  }
+  const template =
+    process.env.WWEBJS_WEB_VERSION_REMOTE_PATH?.trim() ||
+    'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html';
+  return {
+    webVersion: version,
+    webVersionCache: { type: 'remote', remotePath: template.replace('{version}', version) },
+  };
+}
+
+/**
+ * Extracts the JID of the parent community a group is linked to, if any.
+ * The field name has varied across whatsapp-web.js/WA Web versions, so
+ * known candidates are checked in order.
+ */
+export function extractLinkedParentJID(groupMetadata?: GroupMetadataRaw): string | null {
+  const candidate =
+    groupMetadata?.parentGroup ?? groupMetadata?.linkedParentGroup ?? groupMetadata?.linkedParent ?? null;
+
+  if (!candidate) {
+    return null;
+  }
+
+  if (typeof candidate === 'string') {
+    return candidate;
+  }
+
+  return candidate._serialized ?? null;
 }
 
 export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngine {
@@ -88,6 +185,13 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         );
       }
 
+      // Pin the WA-Web version when configured (fixes the 1.34.x "stuck at authenticating"
+      // hang on some setups, #251). Opt-in: unset leaves whatsapp-web.js to auto-select.
+      const versionPin = resolveWebVersionPin();
+      if (versionPin) {
+        this.logger.log(`Pinning WhatsApp Web version ${versionPin.webVersion}`);
+      }
+
       this.client = new Client({
         authStrategy: new LocalAuth({
           clientId: this.config.sessionId,
@@ -96,13 +200,19 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         puppeteer: {
           headless: this.config.puppeteer?.headless ?? true,
           args: puppeteerArgs,
+          // Only override the executable when explicitly configured; otherwise let
+          // whatsapp-web.js fall back to Puppeteer's bundled Chromium.
+          ...(this.config.puppeteer?.executablePath ? { executablePath: this.config.puppeteer.executablePath } : {}),
         },
+        ...(versionPin ?? {}),
       });
 
       this.setupEventHandlers();
       await this.client.initialize();
     } catch (error) {
       this.setStatus(EngineStatus.FAILED);
+      const reason = error instanceof Error ? error.message : String(error);
+      this.callbacks.onError?.(reason);
       throw error;
     }
   }
@@ -143,17 +253,32 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // eslint-disable-next-line @typescript-eslint/no-misused-promises
     this.client.on('message', async msg => {
       try {
-        const incomingMessage: IncomingMessage = {
-          id: msg.id._serialized,
-          from: msg.from,
-          to: msg.to,
-          chatId: msg.from,
-          body: msg.body,
-          type: msg.type,
-          timestamp: msg.timestamp,
-          fromMe: msg.fromMe,
-          isGroup: msg.from.endsWith('@g.us'),
-        };
+        const incomingMessage: IncomingMessage = buildIncomingMessageBase(msg);
+
+        // Enrich the sender contact with the saved name (best-effort, from the WhatsApp Web cache).
+        // `author`/`from` resolve to the actual sender for group and 1:1 messages respectively.
+        try {
+          const contact = await msg.getContact();
+          if (contact?.name || contact?.pushname) {
+            incomingMessage.contact = {
+              name: contact.name || incomingMessage.contact?.name,
+              pushName: contact.pushname || incomingMessage.contact?.pushName,
+            };
+          }
+        } catch (error) {
+          this.logger.error('Error getting message contact', String(error));
+        }
+
+        // Handle location
+        if (msg.type === MessageTypes.LOCATION && msg.location) {
+          incomingMessage.location = {
+            latitude: Number(msg.location.latitude),
+            longitude: Number(msg.location.longitude),
+            description: msg.location.description || undefined,
+            address: msg.location.address || undefined,
+            url: msg.location.url || undefined,
+          };
+        }
 
         // Handle media
         if (msg.hasMedia) {
@@ -190,8 +315,60 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       }
     });
 
+    this.client.on('message_create', msg => {
+      // `message_create` fires for every message the account creates — including ones composed on a
+      // linked phone, which the `message` event above never delivers. Incoming messages are already
+      // handled there, so forward only the account's own outgoing (`fromMe`) messages; this is the
+      // single source for `message.sent` (covers API sends and phone-composed self-messages alike).
+      if (!msg.fromMe) {
+        return;
+      }
+
+      try {
+        this.callbacks.onMessageCreate?.(buildIncomingMessageBase(msg));
+      } catch (error) {
+        this.logger.error('Error processing outgoing message', String(error));
+      }
+    });
+
     this.client.on('message_ack', (msg, ack) => {
-      this.callbacks.onMessageAck?.(msg.id._serialized, ack);
+      // Map the whatsapp-web.js MessageAck integer to the neutral DeliveryStatus here, at the
+      // adapter boundary, so no downstream consumer ever sees engine-specific ack codes.
+      this.callbacks.onMessageAck?.(msg.id._serialized, wwebjsAckToDeliveryStatus(ack));
+    });
+
+    this.client.on('message_revoke_everyone', after => {
+      try {
+        const selfWid = this.client?.info?.wid?._serialized;
+        // Emit structured data only; the engine layer never produces a localized
+        // display string. The dashboard renders the localized "message deleted" text.
+        const payload: RevokedMessage = {
+          id: after.id._serialized,
+          chatId: after.from === selfWid ? after.to : after.from,
+          from: after.from,
+          to: after.to,
+          type: 'revoked',
+          body: '',
+          timestamp: after.timestamp,
+        };
+        this.callbacks.onMessageRevoked?.(payload);
+      } catch (error) {
+        this.logger.error('Error processing message_revoke_everyone', String(error));
+      }
+    });
+
+    this.client.on('message_reaction', reaction => {
+      try {
+        const event: ReactionEvent = {
+          messageId: reaction.msgId._serialized,
+          chatId: reaction.id.remote,
+          reaction: reaction.reaction,
+          senderId: reaction.senderId,
+        };
+        this.callbacks.onMessageReaction?.(event);
+      } catch (error) {
+        this.logger.error('Error processing message_reaction', String(error));
+      }
     });
 
     this.client.on('disconnected', reason => {
@@ -199,9 +376,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       this.callbacks.onDisconnected?.(reason);
     });
 
-    this.client.on('auth_failure', () => {
+    this.client.on('auth_failure', (message?: string) => {
       this.setStatus(EngineStatus.FAILED);
-      this.callbacks.onDisconnected?.('Authentication failed');
+      // Authentication failure is terminal: the stored credentials are invalid and
+      // reconnecting will not help — the operator must re-scan the QR code. Route it
+      // through onError (FAILED, no reconnect) rather than onDisconnected (reconnect).
+      this.callbacks.onError?.(message ? `Authentication failed: ${message}` : 'Authentication failed');
     });
   }
 
@@ -261,6 +441,18 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.qrCode;
   }
 
+  /**
+   * Request an 8-char pairing code so the user can link via "Link with phone number" instead of
+   * scanning the QR. Must be called after the engine has started (the client is initialized and
+   * waiting to link); whatsapp-web.js throws if called before it is ready or after authentication.
+   */
+  async requestPairingCode(phoneNumber: string): Promise<string> {
+    if (!this.client) {
+      throw new EngineNotReadyError();
+    }
+    return this.client.requestPairingCode(phoneNumber);
+  }
+
   getPhoneNumber(): string | null {
     return this.phoneNumber;
   }
@@ -302,7 +494,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     if (typeof media.data === 'string') {
       if (media.data.startsWith('http://') || media.data.startsWith('https://')) {
         // URL
-        messageMedia = await MessageMedia.fromUrl(media.data);
+        messageMedia = await loadRemoteMedia(media.data);
       } else {
         // Base64
         messageMedia = new MessageMedia(media.mimetype, media.data, media.filename);
@@ -354,10 +546,31 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     }
   }
 
-  async checkNumberExists(number: string): Promise<boolean> {
+  async getNumberId(number: string): Promise<string | null> {
     this.ensureReady();
     const numberId = await this.client!.getNumberId(number);
-    return numberId !== null;
+    return numberId?._serialized ?? null;
+  }
+
+  async checkNumberExists(number: string): Promise<boolean> {
+    return (await this.getNumberId(number)) !== null;
+  }
+
+  async resolveContactPhone(contactId: string): Promise<string | null> {
+    this.ensureReady();
+    try {
+      // Queried one id at a time: the batch form is prone to "Evaluation failed" and rate-limiting
+      // (whatsapp-web.js #3857/#3969). `pn` is the phone JID (`<digits>@c.us`) when the account knows
+      // the mapping; best-effort, so a missing mapping or any failure resolves to null.
+      const [result] = await this.client!.getContactLidAndPhone([contactId]);
+      const pn = result?.pn;
+      return pn ? pn.replace(/@c\.us$/i, '').replace(/\D/g, '') || null : null;
+    } catch (error) {
+      this.logger.debug(`resolveContactPhone failed for ${contactId}`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
   }
 
   async getGroups(): Promise<Group[]> {
@@ -367,6 +580,11 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // Filter only group chats
     const groups = chats.filter(chat => chat.isGroup);
 
+    // List path: read linkedParentJID synchronously from whatever metadata getChats()
+    // already loaded. We deliberately do NOT fall back to getChatById per group here —
+    // that would be an N+1 round-trip across every group on every list call. Groups
+    // whose metadata isn't loaded report null; the single-group endpoint (getGroupInfo,
+    // which loads full metadata via getChatById) is the authoritative source.
     return groups.map(g => {
       const groupChat = g as unknown as GroupChat;
       return {
@@ -376,6 +594,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         isAdmin: groupChat.participants?.some(
           p => p.isAdmin && p.id._serialized === this.client?.info?.wid?._serialized,
         ),
+        linkedParentJID: extractLinkedParentJID(groupChat.groupMetadata),
       };
     });
   }
@@ -385,7 +604,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   async sendLocationMessage(chatId: string, location: LocationInput): Promise<MessageResult> {
     this.ensureReady();
     // Import Location class dynamically from whatsapp-web.js
-    const { Location } = await import('whatsapp-web.js');
+    const module = await import('whatsapp-web.js');
+    const Location = module.Location || module.default?.Location;
+
     const loc = new Location(location.latitude, location.longitude, {
       name: location.description || '',
       address: location.address || '',
@@ -423,7 +644,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
     if (typeof media.data === 'string') {
       if (media.data.startsWith('http://') || media.data.startsWith('https://')) {
-        messageMedia = await MessageMedia.fromUrl(media.data);
+        messageMedia = await loadRemoteMedia(media.data);
       } else {
         messageMedia = new MessageMedia(media.mimetype, media.data, media.filename);
       }
@@ -503,6 +724,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         participants,
         isReadOnly: Boolean(groupChat.isReadOnly),
         isAnnounce: Boolean(groupChat.isAnnounce),
+        linkedParentJID: extractLinkedParentJID(groupChat.groupMetadata),
       };
     } catch (error) {
       this.logger.warn(`Failed to get group: ${groupId}`, String(error));
@@ -774,6 +996,40 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   // ========== Gap Quick Wins Implementation ==========
 
+  async getChatHistory(chatId: string, limit: number = 50, includeMedia: boolean = false): Promise<IncomingMessage[]> {
+    this.ensureReady();
+    const chat = await this.client!.getChatById(chatId);
+    const messages = await chat.fetchMessages({ limit });
+    const results: IncomingMessage[] = [];
+    for (const msg of messages) {
+      // Reuse the shared mapper so history messages carry the same author/contact
+      // enrichment as live incoming messages (#223). The mapper defaults chatId to
+      // msg.from, which is wrong here (history includes fromMe messages whose `from`
+      // is our own number), so override it to the requested chat and recompute the
+      // chatId-derived flags (isGroup, isStatusBroadcast) from the real chat.
+      const out = buildIncomingMessageBase(msg);
+      out.chatId = chatId;
+      out.isGroup = chatId.endsWith('@g.us');
+      out.isStatusBroadcast = chatId === 'status@broadcast';
+      if (includeMedia && msg.hasMedia) {
+        try {
+          const media = await msg.downloadMedia();
+          if (media) {
+            out.media = {
+              mimetype: media.mimetype,
+              filename: media.filename || undefined,
+              data: media.data,
+            };
+          }
+        } catch (error) {
+          this.logger.warn(`Failed to download media for ${msg.id._serialized}: ${String(error)}`);
+        }
+      }
+      results.push(out);
+    }
+    return results;
+  }
+
   // Delete Message
   async deleteMessage(chatId: string, messageId: string, forEveryone: boolean = true): Promise<void> {
     this.ensureReady();
@@ -915,9 +1171,66 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   /* eslint-enable @typescript-eslint/require-await, @typescript-eslint/no-unused-vars */
 
+  async getChats(): Promise<ChatSummary[]> {
+    this.ensureReady();
+    const chats = await this.client!.getChats();
+    // Map the raw whatsapp-web.js chat objects to the library-agnostic ChatSummary
+    // shape so that no library types leak past the engine boundary.
+    return chats.map(chat => ({
+      id: chat.id._serialized,
+      name: chat.name,
+      isGroup: chat.isGroup,
+      unreadCount: chat.unreadCount,
+      timestamp: chat.timestamp,
+      lastMessage: chat.lastMessage?.body || undefined,
+    }));
+  }
+
+  async sendSeen(chatId: string): Promise<boolean> {
+    this.ensureReady();
+    try {
+      const chat = await this.client!.getChatById(chatId);
+      return await chat.sendSeen();
+    } catch (error) {
+      this.logger.error(`Error marking chat ${chatId} as read`, String(error));
+      return false;
+    }
+  }
+
+  async deleteChat(chatId: string): Promise<boolean> {
+    this.ensureReady();
+    try {
+      const chat = await this.client!.getChatById(chatId);
+      return await chat.delete();
+    } catch (error) {
+      this.logger.error(`Error deleting chat ${chatId}`, String(error));
+      return false;
+    }
+  }
+
+  async sendChatState(chatId: string, state: ChatState): Promise<void> {
+    this.ensureReady();
+    try {
+      const chat = await this.client!.getChatById(chatId);
+      if (state === 'typing') {
+        await chat.sendStateTyping();
+      } else if (state === 'recording') {
+        await chat.sendStateRecording();
+      } else {
+        await chat.clearState();
+      }
+    } catch (error) {
+      // Presence is best-effort — a failure here must never break the surrounding send.
+      this.logger.error(`Error setting chat state '${state}' for ${chatId}`, String(error));
+    }
+  }
+
   private ensureReady(): void {
     if (this.status !== EngineStatus.READY || !this.client) {
-      throw new Error('WhatsApp client is not ready');
+      // Typed so the global filter returns 409 Conflict ("session not connected")
+      // instead of a 500 when an engine op is attempted while the session is
+      // disconnected / reconnecting / still initializing (#100).
+      throw new EngineNotReadyError();
     }
   }
 }

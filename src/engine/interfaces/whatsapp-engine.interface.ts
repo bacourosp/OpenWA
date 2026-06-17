@@ -12,7 +12,6 @@ export enum EngineStatus {
 export interface MessageResult {
   id: string;
   timestamp: number;
-  ack?: number;
 }
 
 export interface MediaInput {
@@ -22,16 +21,59 @@ export interface MediaInput {
   caption?: string;
 }
 
+/**
+ * Engine-neutral message type. Each adapter maps its library's native message-type tokens
+ * (e.g. whatsapp-web.js `chat`/`ptt`/`vcard`) to this vocabulary at the adapter boundary,
+ * so no consumer outside the adapter sees engine-specific type strings. `unknown` covers any
+ * type the active engine reports that doesn't map to a first-class kind.
+ */
+export type MessageType =
+  | 'text'
+  | 'image'
+  | 'video'
+  | 'audio'
+  | 'voice'
+  | 'document'
+  | 'sticker'
+  | 'location'
+  | 'contact'
+  | 'revoked'
+  | 'unknown';
+
 export interface IncomingMessage {
   id: string;
   from: string;
   to: string;
   chatId: string;
   body: string;
-  type: string;
+  type: MessageType;
   timestamp: number;
   fromMe: boolean;
   isGroup: boolean;
+  /**
+   * True for a status/story broadcast (not a real conversation). Set by the adapter so engine-neutral
+   * code can skip these without matching an engine-specific pseudo-JID (e.g. `status@broadcast`).
+   */
+  isStatusBroadcast?: boolean;
+  /** For group messages, the WID of the participant who actually sent it (`from` is the group JID there). */
+  author?: string;
+  /**
+   * Set by the adapter when the sender is identified by a privacy id (e.g. a WhatsApp `@lid`) rather
+   * than a phone number, so engine-neutral code can decide whether to attempt phone resolution without
+   * matching an engine-specific JID scheme.
+   */
+  isLidSender?: boolean;
+  /**
+   * Best-effort phone number (MSISDN digits) of the sender, resolved from a privacy id when inline
+   * resolution is enabled (`RESOLVE_LID_TO_PHONE`). `null` when the engine cannot map it. Only
+   * populated for `isLidSender` messages.
+   */
+  senderPhone?: string | null;
+  /** Sender display info, best-effort from the WhatsApp Web contact cache. */
+  contact?: {
+    name?: string;
+    pushName?: string;
+  };
   media?: {
     mimetype: string;
     filename?: string;
@@ -40,6 +82,13 @@ export interface IncomingMessage {
   quotedMessage?: {
     id: string;
     body: string;
+  };
+  location?: {
+    latitude: number;
+    longitude: number;
+    description?: string;
+    address?: string;
+    url?: string;
   };
 }
 
@@ -58,6 +107,8 @@ export interface Group {
   name: string;
   participantsCount?: number;
   isAdmin?: boolean;
+  /** JID of the parent community this group is linked to, or null if standalone. */
+  linkedParentJID?: string | null;
 }
 
 export interface GroupParticipant {
@@ -77,6 +128,8 @@ export interface GroupInfo {
   participants: GroupParticipant[];
   isReadOnly?: boolean;
   isAnnounce?: boolean;
+  /** JID of the parent community this group is linked to, or null if standalone. */
+  linkedParentJID?: string | null;
 }
 
 export interface ContactCard {
@@ -194,13 +247,81 @@ export interface PaginatedProducts {
   };
 }
 
+/**
+ * Lightweight summary of a chat, exposed to the dashboard's real-time chats view.
+ * Only library-agnostic primitives are leaked here; raw whatsapp-web.js objects are
+ * mapped to this shape inside the adapter.
+ */
+export interface ChatSummary {
+  id: string;
+  name: string;
+  isGroup: boolean;
+  unreadCount: number;
+  timestamp: number;
+  lastMessage?: string;
+}
+
+/**
+ * Engine-neutral chat presence state. `typing`/`recording` show the indicator to the chat;
+ * `paused` clears it. Best-effort: engines without a presence concept may no-op.
+ */
+export type ChatState = 'typing' | 'recording' | 'paused';
+
+/**
+ * Engine-neutral message delivery status. Each adapter maps its native delivery signal
+ * (e.g. whatsapp-web.js MessageAck integers, Baileys WAMessageStatus) to this vocabulary,
+ * so no consumer outside the adapter sees engine-specific ack codes.
+ */
+export type DeliveryStatus = 'pending' | 'sent' | 'delivered' | 'read' | 'failed';
+
+/**
+ * Structured payload for a remotely-revoked ("deleted for everyone") message.
+ * The engine layer never emits a localized display string; `body` is intentionally
+ * empty and the dashboard renders the localized "message deleted" text.
+ */
+export interface RevokedMessage {
+  id: string;
+  chatId: string;
+  from: string;
+  to: string;
+  type: 'revoked';
+  body: '';
+  timestamp: number;
+}
+
+export interface ReactionEvent {
+  messageId: string;
+  chatId: string;
+  reaction: string;
+  senderId: string;
+}
+
 export interface EngineEventCallbacks {
   onQRCode?: (qr: string) => void;
   onReady?: (phone: string, pushName: string) => void;
   onMessage?: (message: IncomingMessage) => void;
-  onMessageAck?: (messageId: string, ack: number) => void;
+  /**
+   * Fired for messages the account itself created (outgoing) — including sends composed on a
+   * linked phone, which the `message`/`onMessage` event never delivers. Used to emit `message.sent`.
+   */
+  onMessageCreate?: (message: IncomingMessage) => void;
+  /**
+   * Fired when the delivery status of an outgoing message advances. The adapter maps its native
+   * delivery signal to the neutral `DeliveryStatus`, so consumers never see engine-specific codes.
+   */
+  onMessageAck?: (messageId: string, status: DeliveryStatus) => void;
+  onMessageRevoked?: (message: RevokedMessage) => void;
+  onMessageReaction?: (event: ReactionEvent) => void;
   onDisconnected?: (reason: string) => void;
   onStateChanged?: (state: EngineStatus) => void;
+  /**
+   * Fired on a terminal initialization/authentication failure (e.g. Chromium
+   * could not launch, or WhatsApp rejected the stored credentials). The engine
+   * has already moved to FAILED; `reason` carries a human-readable cause that
+   * callers may surface to operators. Distinct from `onDisconnected`, which is
+   * recoverable and triggers reconnection.
+   */
+  onError?: (reason: string) => void;
 }
 
 export interface IWhatsAppEngine {
@@ -213,6 +334,8 @@ export interface IWhatsAppEngine {
   // Status
   getStatus(): EngineStatus;
   getQRCode(): string | null;
+  /** Request an 8-char pairing code to link via phone number instead of scanning the QR. */
+  requestPairingCode(phoneNumber: string): Promise<string>;
   getPhoneNumber(): string | null;
   getPushName(): string | null;
 
@@ -240,6 +363,17 @@ export interface IWhatsAppEngine {
   getContacts(): Promise<Contact[]>;
   getContactById(contactId: string): Promise<Contact | null>;
   checkNumberExists(number: string): Promise<boolean>;
+  /**
+   * Resolve a phone number to its canonical chat id in the engine's native format, or null if the
+   * number is not registered. The engine owns the JID scheme, so callers never build it themselves.
+   */
+  getNumberId(number: string): Promise<string | null>;
+  /**
+   * Best-effort resolution of a contact id to a phone number (MSISDN digits), or `null` when the
+   * engine cannot map it (e.g. a privacy `@lid` the account has never seen). The contact id is the
+   * engine's native scheme; the adapter decides how to resolve it.
+   */
+  resolveContactPhone(contactId: string): Promise<string | null>;
 
   // Groups - Basic
   getGroups(): Promise<Group[]>;
@@ -259,6 +393,7 @@ export interface IWhatsAppEngine {
 
   // Message Operations
   deleteMessage(chatId: string, messageId: string, forEveryone?: boolean): Promise<void>;
+  getChatHistory(chatId: string, limit?: number, includeMedia?: boolean): Promise<IncomingMessage[]>;
 
   // Contact Extended Operations
   getProfilePicture(contactId: string): Promise<string | null>;
@@ -293,4 +428,14 @@ export interface IWhatsAppEngine {
   getProduct(productId: string): Promise<Product | null>;
   sendProduct(chatId: string, productId: string, body?: string): Promise<MessageResult>;
   sendCatalog(chatId: string, body?: string): Promise<MessageResult>;
+
+  // Chats
+  getChats(): Promise<ChatSummary[]>;
+  sendSeen(chatId: string): Promise<boolean>;
+  deleteChat(chatId: string): Promise<boolean>;
+  /**
+   * Send a typing/recording presence indicator to a chat, or clear it (`paused`).
+   * Engine-agnostic and best-effort: engines without a presence concept should no-op.
+   */
+  sendChatState(chatId: string, state: ChatState): Promise<void>;
 }

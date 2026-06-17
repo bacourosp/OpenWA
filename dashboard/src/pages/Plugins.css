@@ -81,12 +81,6 @@
   font-size: 0.75rem;
 }
 
-.feature-more {
-  padding: 0.25rem 0.5rem;
-  color: var(--text-muted);
-  font-size: 0.75rem;
-}
-
 /* Plugins Grid */
 .plugins-grid {
   display: grid;
@@ -368,26 +362,6 @@
 
 .btn-action svg {
   color: var(--text-secondary);
-}
-
-/* Error Banner */
-.error-banner {
-  background: rgba(239, 68, 68, 0.1);
-  border: 1px solid rgba(239, 68, 68, 0.3);
-  border-radius: 8px;
-  padding: 1rem;
-  margin-bottom: 1.5rem;
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-.error-banner svg {
-  color: #ef4444;
-}
-
-.error-banner-text {
-  color: #ef4444;
 }
 
 /* Empty State */

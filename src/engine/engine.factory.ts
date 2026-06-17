@@ -42,7 +42,9 @@ export class EngineFactory implements OnModuleInit {
     };
 
     const wwjsPlugin = new WhatsAppWebJsPlugin();
-    this.pluginLoader.registerBuiltInPlugin(wwjsManifest, wwjsPlugin);
+    // Supply the engine config sub-tree (engine.* from configuration.ts) as an opaque blob;
+    // the plugin reads its own namespace (puppeteer.*, sessionDataPath) from context.config.
+    this.pluginLoader.registerBuiltInPlugin(wwjsManifest, wwjsPlugin, this.configService.get('engine') ?? {});
 
     // Auto-enable the configured engine
     try {
@@ -65,6 +67,9 @@ export class EngineFactory implements OnModuleInit {
     const enginePlugin = this.pluginLoader.getPlugin(this.engineType);
 
     if (enginePlugin?.instance && this.isEnginePlugin(enginePlugin.instance)) {
+      // Engine-neutral per-call config only. Engine-specific config (e.g. Puppeteer for
+      // whatsapp-web.js) is supplied to the plugin as an opaque blob via context.config at
+      // registration, so the factory never assembles browser-shaped fields.
       return enginePlugin.instance.createEngine({
         sessionId: options.sessionId,
         proxyUrl: options.proxyUrl,
@@ -85,7 +90,7 @@ export class EngineFactory implements OnModuleInit {
       typeof instance === 'object' &&
       instance !== null &&
       'type' in instance &&
-      (instance as { type: unknown }).type === PluginType.ENGINE &&
+      instance.type === PluginType.ENGINE &&
       'createEngine' in instance &&
       typeof (instance as { createEngine: unknown }).createEngine === 'function'
     );
@@ -99,6 +104,7 @@ export class EngineFactory implements OnModuleInit {
       puppeteer: {
         headless: this.configService.get<boolean>('engine.puppeteer.headless') ?? true,
         args: this.configService.get<string[]>('engine.puppeteer.args') ?? ['--no-sandbox', '--disable-setuid-sandbox'],
+        executablePath: this.configService.get<string>('engine.puppeteer.executablePath'),
       },
       proxy: options.proxyUrl
         ? {
@@ -113,17 +119,28 @@ export class EngineFactory implements OnModuleInit {
   // Query Methods for API/Dashboard
   // ============================================================================
 
-  getAvailableEngines(): Array<{ id: string; name: string; enabled: boolean; features: string[] }> {
+  getAvailableEngines(): Array<{
+    id: string;
+    name: string;
+    enabled: boolean;
+    features: string[];
+    library?: { name: string; version: string };
+  }> {
     const enginePlugins = this.pluginLoader.getPluginsByType(PluginType.ENGINE);
 
     return enginePlugins.map(plugin => {
-      const features = plugin.instance && this.isEnginePlugin(plugin.instance) ? plugin.instance.getFeatures() : [];
+      const inst = plugin.instance;
+      const features = inst && this.isEnginePlugin(inst) ? inst.getFeatures() : [];
+      // The real underlying library version (e.g. whatsapp-web.js 1.34.7), distinct from the
+      // plugin's manifest version — so the dashboard can show which engine is actually running.
+      const library = inst && this.isEnginePlugin(inst) ? inst.getEngineLibrary?.() : undefined;
 
       return {
         id: plugin.manifest.id,
         name: plugin.manifest.name,
         enabled: this.pluginLoader.isPluginEnabled(plugin.manifest.id),
         features,
+        library,
       };
     });
   }

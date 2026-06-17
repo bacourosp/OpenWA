@@ -3,8 +3,10 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ThrottlerModule } from '@nestjs/throttler';
 import configuration from './config/configuration';
+import { validateEnv } from './config/env.validation';
 import { SessionModule } from './modules/session/session.module';
 import { MessageModule } from './modules/message/message.module';
+import { TemplateModule } from './modules/template/template.module';
 import { WebhookModule } from './modules/webhook/webhook.module';
 import { HealthModule } from './modules/health/health.module';
 import { AuthModule } from './modules/auth/auth.module';
@@ -21,11 +23,13 @@ import { ChannelModule } from './modules/channel/channel.module';
 import { CacheModule } from './common/cache';
 import { StorageModule } from './common/storage/storage.module';
 import { StatsModule } from './modules/stats/stats.module';
+import { MetricsModule } from './modules/metrics/metrics.module';
 import { StatusModule } from './modules/status/status.module';
 import { CatalogModule } from './modules/catalog/catalog.module';
 import { HooksModule } from './core/hooks';
 import { PluginsModule } from './core/plugins';
 import { PluginsApiModule } from './modules/plugins/plugins.module';
+import { ExtensionsModule } from './plugins/extensions/extensions.module';
 
 // Only import QueueModule if explicitly enabled to avoid Redis connection errors
 const queueModules: Array<Type | DynamicModule> = [];
@@ -43,6 +47,7 @@ if (process.env.QUEUE_ENABLED === 'true') {
     ConfigModule.forRoot({
       isGlobal: true,
       load: [configuration],
+      validate: validateEnv,
     }),
 
     // Main Database (always SQLite - boot config)
@@ -50,13 +55,26 @@ if (process.env.QUEUE_ENABLED === 'true') {
       name: 'main',
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (configService: ConfigService) => ({
-        type: 'sqlite' as const,
-        database: configService.get<string>('database.database', './data/main.sqlite'),
-        entities: [__dirname + '/modules/auth/**/*.entity{.ts,.js}', __dirname + '/modules/audit/**/*.entity{.ts,.js}'],
-        synchronize: true,
-        logging: configService.get<boolean>('database.logging', false),
-      }),
+      useFactory: (configService: ConfigService) => {
+        // Default ON for zero-config first boot. When disabled
+        // (MAIN_DATABASE_SYNCHRONIZE=false), the main-owned migrations create the
+        // api_keys/audit_logs schema instead — never both at once.
+        const synchronize = configService.get<boolean>('database.synchronize', true);
+        return {
+          type: 'sqlite' as const,
+          database: configService.get<string>('database.database', './data/main.sqlite'),
+          entities: [
+            __dirname + '/modules/auth/**/*.entity{.ts,.js}',
+            __dirname + '/modules/audit/**/*.entity{.ts,.js}',
+          ],
+          // Dedicated migrations dir for the main connection only (must NOT run the
+          // data-connection migrations, which target session/webhook/message tables).
+          migrations: [__dirname + '/database/migrations-main/*{.ts,.js}'],
+          synchronize,
+          migrationsRun: !synchronize,
+          logging: configService.get<boolean>('database.logging', false),
+        };
+      },
     }),
 
     // Data Storage Database (pluggable - user data)
@@ -71,6 +89,7 @@ if (process.env.QUEUE_ENABLED === 'true') {
             __dirname + '/modules/session/**/*.entity{.ts,.js}',
             __dirname + '/modules/webhook/**/*.entity{.ts,.js}',
             __dirname + '/modules/message/**/*.entity{.ts,.js}',
+            __dirname + '/modules/template/**/*.entity{.ts,.js}',
           ],
           migrations: [__dirname + '/database/migrations/*{.ts,.js}'],
           logging: configService.get<boolean>('dataDatabase.logging', false),
@@ -84,7 +103,14 @@ if (process.env.QUEUE_ENABLED === 'true') {
             port: configService.get<number>('dataDatabase.port'),
             username: configService.get<string>('dataDatabase.username'),
             password: configService.get<string>('dataDatabase.password'),
-            database: 'openwa',
+            database: configService.get<string>('dataDatabase.name', 'openwa'),
+
+            ssl: configService.get<boolean>('dataDatabase.ssl', false)
+              ? {
+                  rejectUnauthorized: configService.get<boolean>('dataDatabase.sslRejectUnauthorized', true),
+                }
+              : false,
+
             // Never auto-sync Postgres in production; rely on migrations.
             synchronize: configService.get<boolean>('dataDatabase.synchronize', false),
             migrationsRun: true,
@@ -147,6 +173,7 @@ if (process.env.QUEUE_ENABLED === 'true') {
     EngineModule,
     SessionModule,
     MessageModule,
+    TemplateModule,
     WebhookModule,
     HealthModule,
     SettingsModule,
@@ -156,9 +183,11 @@ if (process.env.QUEUE_ENABLED === 'true') {
     LabelModule, // Phase 3: Labels Management
     ChannelModule, // Phase 3: Channels/Newsletter
     StatsModule, // Phase 3: Statistics Dashboard
+    MetricsModule, // Prometheus /api/metrics
     StatusModule, // Phase 3: Status/Stories API
     CatalogModule, // Phase 3: Catalog API (WhatsApp Business)
     PluginsApiModule, // Phase 5: Plugins API
+    ExtensionsModule, // First-party extension plugins (registered disabled)
   ],
 })
 export class AppModule {}

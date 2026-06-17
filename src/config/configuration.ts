@@ -22,7 +22,10 @@ export default () => ({
   database: {
     type: 'sqlite' as const,
     database: './data/main.sqlite',
-    synchronize: true,
+    // Schema management for the auth/audit DB. Default ON (zero-config first boot).
+    // Set MAIN_DATABASE_SYNCHRONIZE=false to manage schema via the main-owned migrations
+    // instead (migrationsRun then creates api_keys/audit_logs).
+    synchronize: process.env.MAIN_DATABASE_SYNCHRONIZE !== 'false',
     logging: process.env.DATABASE_LOGGING === 'true',
   },
 
@@ -31,6 +34,10 @@ export default () => ({
     type: process.env.DATABASE_TYPE || 'sqlite',
     // SQLite path (used when type is sqlite)
     database: process.env.DATABASE_NAME || './data/openwa.sqlite',
+    // Postgres database NAME (used when type is postgres). Resolved from the same
+    // DATABASE_NAME env as the migration CLI (data-source.ts) so the runtime factory and
+    // migrations never target different databases. Distinct sqlite-vs-pg defaults.
+    name: process.env.DATABASE_NAME || 'openwa',
     // PostgreSQL/MySQL connection (used when type is postgres/mysql)
     host: process.env.DATABASE_HOST || 'localhost',
     port: parseInt(process.env.DATABASE_PORT || '5432', 10),
@@ -51,6 +58,10 @@ export default () => ({
     puppeteer: {
       headless: process.env.PUPPETEER_HEADLESS !== 'false',
       args: (process.env.PUPPETEER_ARGS || '--no-sandbox,--disable-setuid-sandbox').split(','),
+      // Optional path to a system Chromium/Chrome binary. When unset, whatsapp-web.js
+      // uses Puppeteer's bundled Chromium. Required on hosts where the bundled binary
+      // is missing or incompatible (Alpine, ARM, custom base images).
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     },
     sessionDataPath: process.env.SESSION_DATA_PATH || './data/sessions',
   },
@@ -75,6 +86,18 @@ export default () => ({
       longTtl: parseInt(process.env.RATE_LIMIT_LONG_TTL || '3600000', 10),
       longLimit: parseInt(process.env.RATE_LIMIT_LONG_LIMIT || '1000', 10),
     },
+  },
+
+  // Security configuration
+  security: {
+    // Comma-separated IPs/CIDRs of reverse proxies whose X-Forwarded-For header
+    // may be trusted for client-IP resolution. Empty by default: X-Forwarded-For
+    // is ignored and the direct socket address is used, preventing spoofing of
+    // the API-key allowedIps whitelist.
+    trustedProxies: (process.env.TRUSTED_PROXIES || '')
+      .split(',')
+      .map(proxy => proxy.trim())
+      .filter(Boolean),
   },
 
   // Storage configuration

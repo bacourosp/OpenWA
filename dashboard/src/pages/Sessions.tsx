@@ -26,23 +26,7 @@ export function Sessions() {
   const [selectedSession, setSelectedSession] = useState<Session | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
 
-  useWebSocket({
-    onSessionStatus: useCallback(
-      (event: { sessionId: string; status: string }) => {
-        setSessions(prev =>
-          prev.map(s => (s.id === event.sessionId ? { ...s, status: event.status as Session['status'] } : s)),
-        );
-        if (event.status === 'ready') {
-          toast.success(t('sessions.toasts.readyTitle'), t('sessions.toasts.readyDesc'));
-        } else if (event.status === 'disconnected') {
-          toast.warning(t('sessions.toasts.disconnectedTitle'), t('sessions.toasts.disconnectedDesc'));
-        }
-      },
-      [toast, t],
-    ),
-  });
-
-  const fetchSessions = async () => {
+  const fetchSessions = useCallback(async () => {
     try {
       setLoading(true);
       const data = await sessionApi.list();
@@ -52,7 +36,35 @@ export function Sessions() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [t]);
+
+  const { isConnected, subscribe } = useWebSocket({
+    onSessionStatus: useCallback(
+      (event: { sessionId: string; status: string }) => {
+        setSessions(prev =>
+          prev.map(s => (s.id === event.sessionId ? { ...s, status: event.status as Session['status'] } : s)),
+        );
+        if (event.status === 'ready') {
+          toast.success(t('sessions.toasts.readyTitle'), t('sessions.toasts.readyDesc'));
+        } else if (event.status === 'disconnected') {
+          toast.warning(t('sessions.toasts.disconnectedTitle'), t('sessions.toasts.disconnectedDesc'));
+        } else if (event.status === 'failed') {
+          // Refresh so the card picks up the lastError reason from the API.
+          void fetchSessions();
+          toast.error(t('sessions.toasts.failedTitle'), t('sessions.toasts.failedDesc'));
+        }
+      },
+      [toast, t, fetchSessions],
+    ),
+  });
+
+  // The gateway delivers events only to subscribed rooms; join the wildcard
+  // session.status room so status changes for every session are received live.
+  useEffect(() => {
+    if (isConnected) {
+      subscribe('*', ['session.status', 'session.qr']);
+    }
+  }, [isConnected, subscribe]);
 
   useEffect(() => {
     fetchSessions();
@@ -72,9 +84,16 @@ export function Sessions() {
         fetchSessions();
       }
     } catch {
-      setQrData(null);
-      currentSessionName.current = '';
-      fetchSessions();
+      // Keep qrData alive so the polling interval keeps retrying until the QR
+      // is ready. Only stop polling if the session itself has failed.
+      const currentSession = await sessionApi.get(sessionId).catch(() => null);
+      const stillInitializing = currentSession &&
+        ['initializing', 'connecting', 'qr_ready'].includes(currentSession.status);
+      if (!stillInitializing) {
+        setQrData(null);
+        currentSessionName.current = '';
+        fetchSessions();
+      }
     }
   }, []);
 
@@ -150,12 +169,17 @@ export function Sessions() {
   const handleShowQR = async (id: string) => {
     const session = sessions.find(s => s.id === id);
     const sessionName = session?.name || '';
+    // Show loading state immediately so the modal opens and polling starts
+    // even before Chromium has finished initializing.
+    setQrData({ sessionId: id, sessionName, qrCode: '' });
+    currentSessionName.current = sessionName;
     try {
       const qr = await sessionApi.getQR(id);
       setQrData({ sessionId: id, sessionName, qrCode: qr.qrCode });
     } catch (err) {
       console.error('Failed to get QR:', err);
-      setError(t('sessions.qr.unavailable'));
+      // Do not clear qrData here — keep the loading modal open so the
+      // polling interval (every 5 s) retries until the QR becomes available.
     }
   };
 
@@ -469,6 +493,14 @@ export function Sessions() {
                     <span className="info-label">{t('sessions.card.lastActive')}</span>
                     <span className="info-value">{formatLastActive(session.lastActive)}</span>
                   </div>
+                  {session.status === 'failed' && session.lastError ? (
+                    <div className="info-row session-error">
+                      <span className="info-label">{t('sessions.card.error')}</span>
+                      <span className="info-value error-text" title={session.lastError}>
+                        {session.lastError}
+                      </span>
+                    </div>
+                  ) : null}
                 </div>
               )}
 
