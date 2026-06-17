@@ -4,7 +4,8 @@ import { config, assertConfig } from './config.js';
 import { generateReply } from './agent.js';
 import { sendText, ensureSessionStarted } from './openwa.js';
 import { startSchedulers } from './scheduler.js';
-import { runNasdaqAnalysis } from './jobs/nasdaq-analysis.js';
+import { runNasdaqAnalysis, runSignalAnalysis } from './jobs/nasdaq-analysis.js';
+import { startTelegramListener } from './telegram.js';
 
 assertConfig();
 
@@ -170,4 +171,15 @@ app.listen(config.port, () => {
   console.log(`  session=${config.sessionId} allowedChats=${[...config.allowedChats].join(',') || '(none)'}`);
   ensureSessionStarted().catch((err) => console.error('[session] ensureSessionStarted error:', err));
   startSchedulers();
+
+  if (config.signalsBotToken) {
+    const signalTargets = config.testMode
+      ? ([config.testGroupId].filter(Boolean) as string[])
+      : config.productionGroups;
+
+    startTelegramListener(async (signalText) => {
+      console.log('[telegram] señal detectada → ejecutando análisis consolidado');
+      await runSignalAnalysis(signalText, signalTargets);
+    });
+  }
 });
