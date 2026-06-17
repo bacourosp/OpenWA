@@ -101,37 +101,74 @@ export async function generateReply(input: InboundContext): Promise<string> {
  * still produces output.
  */
 interface GeminiResponse {
-  candidates?: { content?: { parts?: { text?: string }[] } }[];
+  candidates?: {
+    content?: { parts?: { text?: string }[] };
+    finishReason?: string; // "STOP" | "MAX_TOKENS" | "SAFETY" | ...
+  }[];
   error?: { message?: string };
 }
 
 export async function generateWithSearch(systemInstruction: string, userPrompt: string): Promise<string> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${config.geminiSearchModel}:generateContent`;
-  const body = (withSearch: boolean): string =>
+
+  const buildBody = (withSearch: boolean, maxTokens: number, prompt: string): string =>
     JSON.stringify({
       systemInstruction: { parts: [{ text: systemInstruction }] },
-      contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
       ...(withSearch ? { tools: [{ google_search: {} }] } : {}),
-      generationConfig: { temperature: 0.4, maxOutputTokens: 700 },
+      generationConfig: { temperature: 0.4, maxOutputTokens: maxTokens },
     });
 
-  const call = async (withSearch: boolean): Promise<{ ok: boolean; data: GeminiResponse; status: number }> => {
+  const call = async (
+    withSearch: boolean,
+    maxTokens: number,
+    prompt: string,
+  ): Promise<{ ok: boolean; data: GeminiResponse; status: number }> => {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-goog-api-key': config.geminiApiKey },
-      body: body(withSearch),
+      body: buildBody(withSearch, maxTokens, prompt),
     });
     const data = (await res.json().catch(() => ({}))) as GeminiResponse;
     return { ok: res.ok && !data.error, data, status: res.status };
   };
 
-  let r = await call(true);
+  const extractText = (data: GeminiResponse): string =>
+    (data.candidates?.[0]?.content?.parts || []).map((p: { text?: string }) => p.text || '').join('').trim();
+
+  const isTruncated = (data: GeminiResponse): boolean =>
+    data.candidates?.[0]?.finishReason === 'MAX_TOKENS';
+
+  // Attempt 1: Google Search grounding, 1500 tokens
+  let r = await call(true, 1500, userPrompt);
   if (!r.ok) {
-    console.warn(`[nasdaq] google_search falló (${r.status}: ${r.data.error?.message || '?'}); reintento sin búsqueda`);
-    r = await call(false);
+    console.warn(`[gemini] google_search falló (${r.status}: ${r.data.error?.message || '?'}); reintento sin búsqueda`);
+    r = await call(false, 1500, userPrompt);
   }
   if (!r.ok) {
     throw new Error(`gemini ${r.status}: ${r.data.error?.message || JSON.stringify(r.data).slice(0, 200)}`);
   }
-  return (r.data.candidates?.[0]?.content?.parts || []).map((p: { text?: string }) => p.text || '').join('').trim();
+
+  // Attempt 2: If truncated, retry with higher limit + brevity instruction
+  if (isTruncated(r.data)) {
+    console.warn('[gemini] respuesta truncada (MAX_TOKENS) — reintentando con límite mayor y brevedad forzada');
+    const briefPrompt = userPrompt + '\n\n[CRÍTICO: El mensaje DEBE terminar con una oración completa. Prioriza brevedad sobre completitud de temas.]';
+    const r2 = await call(false, 2500, briefPrompt);
+    if (r2.ok && !isTruncated(r2.data)) {
+      return extractText(r2.data);
+    }
+
+    // Attempt 3: Repair with callLLM (multi-provider fallback)
+    console.warn('[gemini] sigue truncado — usando callLLM para reparar mensaje');
+    const partial = extractText(r.data);
+    const repairPrompt = `Tienes este mensaje incompleto de trading para WhatsApp:\n---\n${partial}\n---\nReescríbelo completo en máx 3-4 frases cortas. Debe terminar con "_No es asesoría financiera._"`;
+    try {
+      return await callLLM('Eres un asistente que repara mensajes incompletos de trading.', repairPrompt, 600);
+    } catch (err) {
+      console.error('[gemini] reparación fallida — enviando mensaje parcial:', (err as Error).message);
+      return partial + ' ⚠️ (mensaje incompleto)';
+    }
+  }
+
+  return extractText(r.data);
 }
