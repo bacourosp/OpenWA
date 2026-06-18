@@ -146,7 +146,9 @@ export async function generateWithSearch(systemInstruction: string, userPrompt: 
     r = await call(false, 1500, userPrompt);
   }
   if (!r.ok) {
-    throw new Error(`gemini ${r.status}: ${r.data.error?.message || JSON.stringify(r.data).slice(0, 200)}`);
+    // Gemini unavailable (quota/network) — fall back to callLLM without search grounding
+    console.warn(`[gemini] no disponible (${r.status}) — usando callLLM como fallback`);
+    return callLLM(systemInstruction, userPrompt, 1200);
   }
 
   // Attempt 2: If truncated, retry with higher limit + brevity instruction
