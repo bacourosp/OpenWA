@@ -4,8 +4,7 @@ import { config, assertConfig } from './config.js';
 import { generateReply } from './agent.js';
 import { sendText, ensureSessionStarted } from './openwa.js';
 import { startSchedulers } from './scheduler.js';
-import { runNasdaqAnalysis, runSignalAnalysis } from './jobs/nasdaq-analysis.js';
-import { startTelegramListener } from './telegram.js';
+import { runNasdaqAnalysis } from './jobs/nasdaq-analysis.js';
 
 assertConfig();
 
@@ -172,19 +171,4 @@ app.listen(config.port, () => {
   ensureSessionStarted().catch((err) => console.error('[session] ensureSessionStarted error:', err));
   startSchedulers();
 
-  if (config.signalsBotToken) {
-    const signalTargets = config.testMode
-      ? ([config.testGroupId].filter(Boolean) as string[])
-      : config.productionGroups;
-
-    startTelegramListener(async (signalText) => {
-      const day = new Date().getDay(); // 0=Dom, 6=Sáb
-      if (day === 0 || day === 6) {
-        console.log('[telegram] señal ignorada — fin de semana');
-        return;
-      }
-      console.log('[telegram] señal detectada → ejecutando análisis consolidado');
-      await runSignalAnalysis(signalText, signalTargets);
-    });
-  }
 });

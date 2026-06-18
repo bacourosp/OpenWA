@@ -83,11 +83,6 @@ export const config = {
   // Token to protect the admin endpoints (manual trigger). Empty = open in dev.
   adminToken: env('ADMIN_TOKEN'),
 
-  // Telegram signals listener (CLUB DE QUANTS — thread 39)
-  signalsBotToken: env('SIGNALS_BOT_TOKEN'),
-  signalsChannelId: Number(env('SIGNALS_CHANNEL_ID', '0')),
-  signalsThreadId: Number(env('SIGNALS_THREAD_ID', '0')),
-
   // Guardrails.
   ignoreFromMe: env('IGNORE_FROM_ME', 'true') === 'true',
   maxInboundChars: Number(env('MAX_INBOUND_CHARS', '4000')),
