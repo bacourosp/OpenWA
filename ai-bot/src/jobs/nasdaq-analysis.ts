@@ -21,13 +21,16 @@ export async function buildNasdaqAnalysis(signalContext?: string): Promise<strin
         signalContext.trim(),
         '--- FIN SEÑAL ---',
         '',
-        'Esta señal ya tiene dirección y niveles definidos por el indicador QUANTUM.',
+        'Esta señal ya tiene dirección y niveles definidos.',
         'Tu tarea es proveer SOLO contexto macro que explique o complemente esos niveles de precio.',
         'Menciona si hay noticias o datos del calendario económico que afecten esa zona de precio.',
-        'NO repitas la señal ni das otra recomendación direccional. Solo contexto y factores a vigilar.',
+        'NO repitas la señal ni des otra recomendación direccional. Solo contexto y factores a vigilar.',
+        'NO incluyas referencias numéricas como [1], [2], [3]. Parafrasea con tus propias palabras — nunca copies textualmente.',
         '',
       ].join('\n')
     : '';
+
+  const wordLimit = signalContext ? '120' : '220';
 
   const systemInstruction = [
     'Eres un analista fundamental del NASDAQ-100 (NAS100/USTEC/NQ=F).',
@@ -42,7 +45,7 @@ export async function buildNasdaqAnalysis(signalContext?: string): Promise<strin
     '• 2-3 noticias macro más relevantes para el NASDAQ hoy',
     '• Calendario económico si hay datos importantes (CPI, NFP, FOMC, etc.)',
     '• Qué factores estar mirando hoy (sin decir hacia dónde va el precio)',
-    'Máximo 220 palabras.',
+    `Máximo ${wordLimit} palabras.`,
   ].join('\n');
 
   const userPrompt =
@@ -69,14 +72,14 @@ export async function runNasdaqAnalysis(
   return { sent, text };
 }
 
+function stripCitations(text: string): string {
+  return text.replace(/\[\d+\]/g, '').replace(/ {2,}/g, ' ').trim();
+}
+
 function formatConsolidated(signal: string, analysis: string): string {
   return [
-    '🚨 *SEÑAL QUANTUM*',
-    '',
+    'Buenos días, la señal del día es',
     signal.trim(),
-    '',
-    '─────────────────',
-    '📊 *CONTEXTO FUNDAMENTAL*',
     '',
     analysis,
   ].join('\n');
@@ -84,7 +87,8 @@ function formatConsolidated(signal: string, analysis: string): string {
 
 export async function runSignalAnalysis(signalText: string, targets: string[]): Promise<void> {
   console.log(`[signal-analysis] iniciando análisis con contexto de señal → ${targets.join(', ')}`);
-  const analysis = await buildNasdaqAnalysis(signalText);
+  const raw = await buildNasdaqAnalysis(signalText);
+  const analysis = stripCitations(raw);
   const message = formatConsolidated(signalText, analysis);
   for (const chatId of targets) {
     try {

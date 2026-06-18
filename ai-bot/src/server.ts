@@ -178,6 +178,11 @@ app.listen(config.port, () => {
       : config.productionGroups;
 
     startTelegramListener(async (signalText) => {
+      const day = new Date().getDay(); // 0=Dom, 6=Sáb
+      if (day === 0 || day === 6) {
+        console.log('[telegram] señal ignorada — fin de semana');
+        return;
+      }
       console.log('[telegram] señal detectada → ejecutando análisis consolidado');
       await runSignalAnalysis(signalText, signalTargets);
     });
