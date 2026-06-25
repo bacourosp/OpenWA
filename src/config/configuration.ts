@@ -1,6 +1,9 @@
 export default () => ({
   port: parseInt(process.env.PORT || '2785', 10),
 
+  // Gemini API key (optional — used by the conversation analysis feature).
+  geminiApiKey: process.env.GEMINI_API_KEY ?? '',
+
   // Redis configuration
   redis: {
     host: process.env.REDIS_HOST || 'localhost',

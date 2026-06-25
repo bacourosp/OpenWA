@@ -794,3 +794,36 @@ export const statsApi = {
   getOverview: () => request<OverviewStats>('/stats/overview'),
   getMessages: (period: StatsPeriod) => request<MessageStats>(`/stats/messages?period=${period}`),
 };
+
+// =============================================================================
+// Conversation Analysis (AI)
+// =============================================================================
+
+export type AnalysisPeriod = '7d' | '30d' | '90d';
+
+export interface RecommendedAction {
+  type: 'follow_up' | 'schedule_call' | 'respond_pending' | 'send_info' | 'other';
+  priority: 'high' | 'medium' | 'low';
+  description: string;
+  suggestedMessage?: string;
+}
+
+export interface ConversationAnalysis {
+  summary: string;
+  highlights: string[];
+  actions: RecommendedAction[];
+  meta: {
+    messageCount: number;
+    period: AnalysisPeriod;
+    from: string;
+    to: string;
+  };
+}
+
+export const conversationApi = {
+  analyze: (sessionId: string, chatId: string, period: AnalysisPeriod) =>
+    request<ConversationAnalysis>(`/sessions/${sessionId}/conversations/analyze`, {
+      method: 'POST',
+      body: JSON.stringify({ chatId, period }),
+    }),
+};

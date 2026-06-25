@@ -74,7 +74,8 @@
     "infrastructure": "Infraestructura",
     "plugins": "Plugins",
     "logs": "Registros",
-    "templates": "Plantillas"
+    "templates": "Plantillas",
+    "conversationAnalysis": "Análisis IA"
   },
   "chats": {
     "subtitle": "Envía y responde mensajes de WhatsApp en tiempo real",
@@ -719,5 +720,23 @@
       "saveOverride": "Guardar anulación",
       "clearOverride": "Borrar anulación"
     }
+  },
+  "conversationAnalysis": {
+    "title": "Análisis de Conversación",
+    "subtitle": "Resumen y acciones recomendadas generadas por IA",
+    "selectSession": "Selecciona una sesión para ver los chats",
+    "selectChat": "Selecciona un chat para analizar",
+    "noChats": "No hay chats disponibles",
+    "period7d": "7 días",
+    "period30d": "1 mes",
+    "period90d": "3 meses",
+    "analyze": "Analizar",
+    "analyzing": "Analizando...",
+    "summaryTitle": "Resumen",
+    "actionsTitle": "Acciones recomendadas",
+    "suggestedMsg": "Mensaje sugerido",
+    "messageCount": "{{count}} mensajes analizados",
+    "noMessages": "No hay mensajes en este período para este chat.",
+    "placeholder": "Selecciona un chat y un período, luego haz clic en Analizar"
   }
 }

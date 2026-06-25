@@ -74,7 +74,8 @@
     "messageTester": "Message Tester",
     "infrastructure": "Infrastructure",
     "plugins": "Plugins",
-    "logs": "Logs"
+    "logs": "Logs",
+    "conversationAnalysis": "AI Analysis"
   },
   "chats": {
     "subtitle": "Send and reply to WhatsApp messages in real time",
@@ -719,5 +720,23 @@
       "saveOverride": "Save override",
       "clearOverride": "Clear override"
     }
+  },
+  "conversationAnalysis": {
+    "title": "Conversation Analysis",
+    "subtitle": "AI-generated summary and recommended actions",
+    "selectSession": "Select a session to see chats",
+    "selectChat": "Select a chat to analyze",
+    "noChats": "No chats available",
+    "period7d": "7 days",
+    "period30d": "1 month",
+    "period90d": "3 months",
+    "analyze": "Analyze",
+    "analyzing": "Analyzing...",
+    "summaryTitle": "Summary",
+    "actionsTitle": "Recommended actions",
+    "suggestedMsg": "Suggested message",
+    "messageCount": "{{count}} messages analyzed",
+    "noMessages": "No messages found in this period for this chat.",
+    "placeholder": "Select a chat and a period, then click Analyze"
   }
 }
