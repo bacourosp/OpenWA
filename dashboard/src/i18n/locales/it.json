@@ -1,4 +1,10 @@
 {
+  "toast": {
+    "connectionLost": {
+      "title": "Connessione al server persa",
+      "message": "Il server backend non è raggiungibile. Verifica che il server sia in esecuzione."
+    }
+  },
   "common": {
     "appName": "OpenWA",
     "appSubtitle": "WhatsApp API",
@@ -53,14 +59,17 @@
     "light": "Chiaro",
     "dark": "Scuro",
     "system": "Sistema",
-    "label": "Tema: {{value}}"
+    "label": "Tema: {{value}}",
+    "appearance": "Aspetto",
+    "mode": "Modalità",
+    "palette": "Tavolozza"
   },
   "nav": {
     "dashboard": "Dashboard",
     "sessions": "Sessioni",
     "chats": "Chat",
     "webhooks": "Webhook",
-    "templates": "Templates",
+    "templates": "Modelli",
     "apiKeys": "Chiavi API",
     "messageTester": "Tester Messaggi",
     "infrastructure": "Infrastruttura",
@@ -134,7 +143,8 @@
       "activeSessions": "Sessioni Attive",
       "messagesToday": "Messaggi di Oggi",
       "webhooksConfigured": "Webhook Configurati",
-      "apiCalls": "Chiamate API (24h)"
+      "apiCalls": "Chiamate API (24h)",
+      "totalMessages": "Messaggi totali"
     },
     "sessionsOverview": "Panoramica Sessioni",
     "showingSessions": "Visualizzazione di {{shown}} di {{total}} sessioni",
@@ -149,7 +159,22 @@
     "view": "Visualizza",
     "disconnect": "Disconnetti",
     "errorPrefix": "Errore: {{message}}",
-    "loadError": "Impossibile caricare i dati"
+    "loadError": "Impossibile caricare i dati",
+    "charts": {
+      "title": "Analisi messaggi",
+      "period": {
+        "24h": "24 h",
+        "7d": "7 g",
+        "30d": "30 g"
+      },
+      "overTime": "Messaggi nel tempo",
+      "byType": "Messaggi per tipo",
+      "topChats": "Chat principali",
+      "sent": "Inviati",
+      "received": "Ricevuti",
+      "messages": "Messaggi",
+      "empty": "Nessuna attività di messaggi in questo periodo."
+    }
   },
   "sessionStatus": {
     "created": "Nuova",
@@ -226,7 +251,8 @@
       "start": "Avvia",
       "stop": "Ferma",
       "reconnect": "Riconnetti",
-      "delete": "Elimina"
+      "delete": "Elimina",
+      "killStuck": "Termina sessione bloccata"
     },
     "toasts": {
       "readyTitle": "Sessione Pronta",
@@ -241,6 +267,16 @@
       "sessionId": "ID Sessione",
       "lastActive": "Ultima Attività",
       "error": "Errore"
+    },
+    "forceKill": {
+      "title": "Termina sessione bloccata",
+      "message": "Sei sicuro di voler terminare forzatamente la sessione \"{{name}}\"?",
+      "warning": "Questa operazione terminerà forzatamente il processo del browser WhatsApp. Potrebbe essere necessario eseguire una nuova scansione della sessione al riavvio.",
+      "confirm": "Termina sessione",
+      "successTitle": "Sessione terminata",
+      "success": "La sessione è stata terminata forzatamente. Puoi riavviarla ora.",
+      "failedTitle": "Terminazione forzata non riuscita",
+      "failed": "Impossibile terminare forzatamente la sessione."
     }
   },
   "webhooks": {
@@ -256,6 +292,36 @@
     "events": "Eventi",
     "available": "Eventi Disponibili",
     "saveChanges": "Salva Modifiche",
+    "filters": {
+      "title": "Filtri (opzionale)",
+      "hint": "Attiva solo quando tutte le condizioni corrispondono. Si applica agli eventi dei messaggi.",
+      "badge": "{{count}} filtro",
+      "badge_other": "{{count}} filtri",
+      "addCondition": "Aggiungi condizione",
+      "removeCondition": "Rimuovi condizione",
+      "caseSensitive": "Distingui maiuscole",
+      "contactPlaceholder": "Numero o ID WhatsApp...",
+      "textPlaceholder": "Testo da cercare...",
+      "addValue": "Aggiungi \"{{value}}\"",
+      "yes": "Sì",
+      "no": "No",
+      "fields": {
+        "sender": "Mittente",
+        "recipient": "Destinatario",
+        "body": "Corpo del messaggio",
+        "type": "Tipo di messaggio",
+        "isGroup": "È una chat di gruppo",
+        "fromMe": "Inviato da me",
+        "hasMedia": "Contiene media",
+        "mentions": "Menzioni"
+      },
+      "operators": {
+        "is": "è",
+        "isNot": "non è",
+        "contains": "contiene",
+        "equals": "è uguale a"
+      }
+    },
     "columns": {
       "url": "URL",
       "events": "Eventi",
@@ -293,48 +359,48 @@
     }
   },
   "templates": {
-    "title": "Templates",
-    "subtitle": "Create reusable message templates for each WhatsApp session",
-    "createTitle": "Create Template",
-    "editTitle": "Edit Template",
-    "newTemplate": "New Template",
-    "createTemplate": "Create Template",
-    "saveChanges": "Save Changes",
-    "viewOnly": "View Only",
-    "noSessions": "No sessions",
-    "sessionHint": "Saved under {{name}}",
-    "namePlaceholder": "e.g., order-confirmation",
-    "header": "Header",
-    "headerPlaceholder": "Optional intro line",
-    "body": "Body",
-    "bodyPlaceholder": "Hi {{customer}}, your order {{orderId}} is ready.",
-    "footer": "Footer",
-    "footerPlaceholder": "Optional closing line",
-    "previewTitle": "Preview",
-    "previewValuePlaceholder": "Sample value",
-    "previewEmpty": "Start writing a template to preview it here.",
-    "noPlaceholders": "Use {{name}} placeholders to test substitutions.",
-    "savedTitle": "Saved Templates",
-    "count": "{{count}} total",
-    "deleteTitle": "Delete Template",
-    "deleteConfirm": "Delete template \"{{name}}\"? This action cannot be undone.",
+    "title": "Modelli",
+    "subtitle": "Crea modelli di messaggio riutilizzabili per ogni sessione WhatsApp",
+    "createTitle": "Crea Modello",
+    "editTitle": "Modifica Modello",
+    "newTemplate": "Nuovo Modello",
+    "createTemplate": "Crea Modello",
+    "saveChanges": "Salva modifiche",
+    "viewOnly": "Visualizza soltanto",
+    "noSessions": "Nessuna sessione",
+    "sessionHint": "Salvato sotto {{name}}",
+    "namePlaceholder": "ad es., conferma-ordine",
+    "header": "Intestazione",
+    "headerPlaceholder": "Linea introduttiva facoltativa",
+    "body": "Corpo",
+    "bodyPlaceholder": "Ciao {{customer}}, il tuo ordine {{orderId}} è pronto.",
+    "footer": "Piè di pagina",
+    "footerPlaceholder": "Linea di chiusura facoltativa",
+    "previewTitle": "Anteprima",
+    "previewValuePlaceholder": "Valore campione",
+    "previewEmpty": "Inizia a scrivere un modello per visualizzarne l'anteprima qui.",
+    "noPlaceholders": "Usa {{name}} segnaposto per testare le sostituzioni.",
+    "savedTitle": "Modelli salvati",
+    "count": "{{count}} totale",
+    "deleteTitle": "Elimina modello",
+    "deleteConfirm": "Eliminare il modello \"{{name}}\"? Questa azione non può essere annullata.",
     "actions": {
-      "copyName": "Copy template name"
+      "copyName": "Copia il nome del modello"
     },
     "empty": {
-      "title": "No templates saved",
-      "description": "Create a reusable template to speed up common replies and notifications.",
-      "noSessionsTitle": "No sessions available",
-      "noSessionsDesc": "Create a WhatsApp session before adding templates."
+      "title": "Nessun modello salvato",
+      "description": "Crea un modello riutilizzabile per velocizzare le risposte e le notifiche più comuni..",
+      "noSessionsTitle": "Nessuna sessione disponibile",
+      "noSessionsDesc": "Crea una sessione WhatsApp prima di aggiungere i modelli."
     },
     "toasts": {
-      "created": "Template created successfully",
-      "createFailed": "Failed to create template: {{message}}",
-      "updated": "Template updated successfully",
-      "updateFailed": "Failed to update template: {{message}}",
-      "deleted": "Template deleted successfully",
-      "deleteFailed": "Failed to delete template: {{message}}",
-      "copied": "Template name copied"
+      "created": "Modello creato con successo",
+      "createFailed": "Impossibile creare il modello: {{message}}",
+      "updated": "Modello aggiornato correttamente",
+      "updateFailed": "Impossibile aggiornare il modello: {{message}}",
+      "deleted": "Modello eliminato con successo",
+      "deleteFailed": "Impossibile eliminare il modello: {{message}}",
+      "copied": "Nome del modello copiato"
     }
   },
   "apiKeys": {
@@ -502,6 +568,17 @@
       "migrationsStatus": "Lo schema è sincronizzato automaticamente con TypeORM",
       "migrationsHint": "Le migrazioni sono gestite automaticamente. Usa la CLI per le migrazioni manuali."
     },
+    "engine": {
+      "title": "Motore WhatsApp",
+      "subtitle": "Scegli e configura il motore di connessione di WhatsApp.",
+      "builtIn": "Integrato",
+      "headless": "Modalità headless",
+      "headlessDesc": "Esegui il browser senza interfaccia visibile (consigliato per la produzione).",
+      "sessionDataPath": "Percorso dati sessione",
+      "browserArgs": "Argomenti del browser",
+      "noBrowser": "Questo motore si connette tramite WebSocket: non ha un browser, quindi non ci sono impostazioni per la modalità headless o gli argomenti del browser. Il motore attivo viene applicato dopo un riavvio.",
+      "restartNote": "Il cambio di motore ha effetto dopo il riavvio del server."
+    },
     "redis": {
       "title": "Redis",
       "enable": "Abilita Redis",
@@ -565,7 +642,7 @@
   },
   "plugins": {
     "title": "Plugin",
-    "subtitle": "Gestisci i motori, i backend di storage e le estensioni",
+    "subtitle": "Installa, configura e gestisci le estensioni",
     "refresh": "Aggiorna",
     "engineCard": "Motore WhatsApp Attivo",
     "running": "In esecuzione",
@@ -579,6 +656,11 @@
     "disable": "Disabilita",
     "healthCheck": "Controllo dello Stato (Health Check)",
     "configure": "Configura",
+    "available": "Disponibili",
+    "install": "Installa plugin",
+    "uninstall": "Disinstalla",
+    "uninstallConfirm": "Disinstallare \"{{name}}\"? Questa operazione ne elimina i file.",
+    "engineSwitchHint": "Imposta come motore attivo nelle Impostazioni, poi riavvia",
     "empty": {
       "title": "Nessun Plugin Trovato",
       "description": "Installa i plugin per estendere le funzionalità di OpenWA"
@@ -592,7 +674,23 @@
       "sessionDataPath": "Percorso Dati Sessione",
       "browserArgs": "Argomenti del Browser",
       "noOptions": "Nessuna opzione di configurazione disponibile per questo plugin",
-      "save": "Salva Configurazione"
+      "save": "Salva Configurazione",
+      "addItem": "Aggiungi",
+      "tabConfig": "Configurazione",
+      "tabSessions": "Sessioni"
+    },
+    "rail": {
+      "engine": "Motore attivo",
+      "enabled": "abilitati",
+      "installed": "installati",
+      "active": "Plugin attivi",
+      "none": "Nessuno ancora abilitato"
+    },
+    "installModal": {
+      "title": "Installa un plugin",
+      "hint": "Carica un plugin pacchettizzato come file .zip (con un manifest.json). Viene eseguito in sandbox una volta abilitato.",
+      "choose": "Scegli un file .zip…",
+      "tooLarge": "Il file supera il limite di 5 MB."
     },
     "toasts": {
       "errorTitle": "Errore Plugin",
@@ -602,7 +700,24 @@
       "healthError": "Errore nel Controllo dello Stato",
       "savedTitle": "Configurazione Salvata",
       "savedDesc": "È richiesto il riavvio del server per applicare le modifiche.",
-      "saveFailed": "Salvataggio non riuscito"
+      "saveFailed": "Salvataggio non riuscito",
+      "installed": "Plugin installato",
+      "installFailed": "Installazione non riuscita",
+      "uninstalled": "Plugin disinstallato",
+      "uninstallFailed": "Disinstallazione non riuscita"
+    },
+    "sessions": {
+      "activationTitle": "Esegui per",
+      "activationDesc": "Scegli per quali sessioni viene eseguito questo plugin.",
+      "allSessions": "Tutte le sessioni",
+      "specificSessions": "Sessioni specifiche",
+      "noSessions": "Nessuna sessione ancora.",
+      "saveActivation": "Salva attivazione",
+      "perSessionTitle": "Configurazione per sessione",
+      "perSessionDesc": "Sostituisci la configurazione globale per una sessione; i campi non modificati ereditano il valore globale.",
+      "selectSession": "Seleziona una sessione…",
+      "saveOverride": "Salva override",
+      "clearOverride": "Rimuovi override"
     }
   }
 }

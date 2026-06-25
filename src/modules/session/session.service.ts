@@ -8,11 +8,14 @@ import {
   OnApplicationBootstrap,
 } from '@nestjs/common';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
-import { Repository, In, Not, IsNull, DataSource } from 'typeorm';
+import { Repository, In, Not, IsNull, DataSource, FindManyOptions } from 'typeorm';
+import { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { Session, SessionStatus } from './entities/session.entity';
 import { Message, MessageDirection, MessageStatus } from '../message/entities/message.entity';
 import { CreateSessionDto } from './dto';
 import { EngineFactory } from '../../engine/engine.factory';
+import { paginate, ListOptions } from '../../common/utils/paginate';
+import { isUniqueConstraintError } from '../../common/utils/unique-constraint.util';
 import {
   IWhatsAppEngine,
   EngineStatus,
@@ -20,6 +23,7 @@ import {
   ChatState,
   DeliveryStatus,
   IncomingMessage,
+  ReactionEvent,
 } from '../../engine/interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
 import { EventsGateway } from '../events/events.gateway';
@@ -36,6 +40,46 @@ interface ReconnectState {
   timer: NodeJS.Timeout | null;
   maxAttempts: number;
   baseDelay: number;
+}
+
+// Reconnect-backoff bounds. An OPERATOR-supplied session.config feeds this math, so the values
+// are coerced + clamped: a non-numeric value would otherwise make the delay NaN (setTimeout fires
+// at 0 — relaunch storm) and the terminal guard `attempts >= NaN` always false (unbounded loop).
+const RECONNECT_BASE_DELAY_MIN_MS = 1000;
+const RECONNECT_BASE_DELAY_MAX_MS = 300_000;
+const RECONNECT_MAX_ATTEMPTS_CAP = 20;
+const RECONNECT_DELAY_CAP_MS = 3_600_000;
+/**
+ * Delay before retrying an ack UPDATE that matched 0 rows. A fast delivered/read ack can arrive before
+ * the send's 2nd save (which writes waMessageId) has committed, so the first UPDATE finds no row. One
+ * retry after this delay closes that race; the forward-only transition guard keeps it idempotent.
+ */
+export const ACK_RECONCILE_DELAY_MS = 750;
+
+const clampNumber = (n: number, min: number, max: number): number => Math.min(Math.max(n, min), max);
+
+/** Coerce + clamp the untyped session.config reconnect knobs to finite, bounded values. Defaults
+ *  (5000ms / 5 attempts) are preserved; a legitimate `maxReconnectAttempts: 0` (disable) is kept. */
+export function resolveReconnectConfig(
+  config: { maxReconnectAttempts?: unknown; reconnectBaseDelay?: unknown } | null,
+): { maxAttempts: number; baseDelay: number } {
+  const baseRaw = Number(config?.reconnectBaseDelay);
+  const baseDelay = clampNumber(
+    Number.isFinite(baseRaw) ? baseRaw : 5000,
+    RECONNECT_BASE_DELAY_MIN_MS,
+    RECONNECT_BASE_DELAY_MAX_MS,
+  );
+  const attemptsRaw = Number(config?.maxReconnectAttempts);
+  const maxAttempts = Math.floor(
+    clampNumber(Number.isFinite(attemptsRaw) ? attemptsRaw : 5, 0, RECONNECT_MAX_ATTEMPTS_CAP),
+  );
+  return { maxAttempts, baseDelay };
+}
+
+/** Clamp a computed backoff delay finite and within setTimeout's safe range (a huge value would
+ *  overflow its 32-bit ms field and fire immediately). */
+export function clampReconnectDelay(rawDelay: number, baseDelay: number): number {
+  return clampNumber(Number.isFinite(rawDelay) ? rawDelay : baseDelay, 0, RECONNECT_DELAY_CAP_MS);
 }
 
 @Injectable()
@@ -57,11 +101,26 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   // Reconnection state per session
   private reconnectStates: Map<string, ReconnectState> = new Map();
 
+  // Last session.status value dispatched to webhooks per session. Some engines signal one transition
+  // via BOTH onStateChanged and a dedicated callback (onQRCode/onDisconnected), so this guards the
+  // webhook POST against firing the same status twice. Cleared on delete().
+  private readonly lastDispatchedStatus = new Map<string, SessionStatus>();
+
   // Sessions currently being stopped/deleted. An in-flight executeReconnect awaits
   // engine init, so a stop/delete during that window could re-register an engine AFTER
   // teardown (orphan). stop()/delete() add the id here; executeReconnect checks it after its
   // awaits and destroys any engine it just created; start() clears it (intentional restart).
   private stoppingSessions: Set<string> = new Set();
+
+  // Sessions whose engine is mid-initialization (a start() is in flight). Reserved synchronously
+  // in start() so a near-simultaneous second start() can't pass the engines.has() check during the
+  // awaited hook and orphan an engine the lifecycle could never destroy.
+  private initializingSessions: Set<string> = new Set();
+
+  // Serializes the read-modify-write of a message's reactions map per `${sessionId}:${waMessageId}`,
+  // so two concurrent reaction events on the same message don't clobber each other (both read the
+  // same snapshot, both full-row save, last writer wins). Entries are deleted once their chain drains.
+  private reactionChains: Map<string, Promise<void>> = new Map();
 
   constructor(
     @InjectRepository(Session, 'data')
@@ -158,18 +217,32 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   /** Destroy one engine, isolating + time-bounding failures so shutdown can't be stalled or aborted. */
   private async destroyEngineSafely(sessionId: string, engine: IWhatsAppEngine): Promise<void> {
     this.logger.log(`Destroying engine for session ${sessionId}`, { sessionId, action: 'shutdown' });
+    await this.teardownEngineSafely(sessionId, engine, e => e.destroy(), 'destroy');
+  }
+
+  /**
+   * Run an engine teardown (destroy/disconnect), isolating + time-bounding failures so a stuck
+   * Chromium/socket can neither hang nor abort the caller. Always resolves — the caller is then free
+   * to reconcile the engines Map and proceed with DB cleanup regardless of teardown outcome.
+   */
+  private async teardownEngineSafely(
+    sessionId: string,
+    engine: IWhatsAppEngine,
+    teardown: (e: IWhatsAppEngine) => Promise<void>,
+    label: 'destroy' | 'disconnect' | 'force-destroy',
+  ): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        engine.destroy(),
+        teardown(engine),
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error('engine.destroy() timed out')), 10_000);
+          timer = setTimeout(() => reject(new Error(`engine.${label}() timed out`)), 10_000);
         }),
       ]);
     } catch (err) {
-      this.logger.error(`Failed to destroy engine for session ${sessionId} during shutdown`, String(err), {
+      this.logger.error(`Failed to ${label} engine for session ${sessionId}`, String(err), {
         sessionId,
-        action: 'shutdown_destroy_failed',
+        action: `engine_${label}_failed`,
       });
     } finally {
       if (timer) clearTimeout(timer);
@@ -211,10 +284,15 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     return saved;
   }
 
-  async findAll(): Promise<Session[]> {
-    const sessions = await this.sessionRepository.find({
-      order: { createdAt: 'DESC' },
-    });
+  async findAll(allowedSessions?: string[] | null): Promise<Session[]> {
+    // A session-restricted key only lists its own sessions; an unrestricted key (null/empty
+    // allowlist) lists all — mirroring the ApiKeyGuard allowedSessions model so a scoped key
+    // cannot enumerate every session through this aggregate route.
+    const options: FindManyOptions<Session> = { order: { createdAt: 'DESC' } };
+    if (allowedSessions && allowedSessions.length > 0) {
+      options.where = { id: In(allowedSessions) };
+    }
+    const sessions = await this.sessionRepository.find(options);
     return sessions.map(session => this.attachLastError(session));
   }
 
@@ -252,71 +330,182 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // Cancel any reconnection attempts
     this.cancelReconnect(id);
 
-    // Stop engine if running
-    const engine = this.engines.get(id);
-    if (engine) {
-      await engine.destroy();
-      this.engines.delete(id);
-    }
+    try {
+      // Stop engine if running — time-bounded + isolated so a stuck Chromium destroy() can't wedge
+      // the delete; the Map is reconciled and the DB removal proceeds regardless of the outcome.
+      const engine = this.engines.get(id);
+      if (engine) {
+        await this.teardownEngineSafely(id, engine, e => e.destroy(), 'destroy');
+        this.engines.delete(id);
+      }
 
-    // Execute hook BEFORE delete so plugins can access session data
-    await this.hookManager.execute(
-      'session:deleted',
-      {
-        id: session.id,
-        name: session.name,
-        phone: session.phone,
-        pushName: session.pushName,
-      },
-      {
+      // Execute hook BEFORE delete so plugins can access session data
+      await this.hookManager.execute(
+        'session:deleted',
+        {
+          id: session.id,
+          name: session.name,
+          phone: session.phone,
+          pushName: session.pushName,
+        },
+        {
+          sessionId: id,
+          source: 'SessionService',
+        },
+      );
+
+      // DB removal is NOT best-effort: a genuine failure must surface (500) rather than be swallowed.
+      await this.dataSource.transaction(async manager => {
+        await manager.remove(session);
+      });
+      this.logger.log(`Session deleted: ${session.name}`, {
         sessionId: id,
-        source: 'SessionService',
-      },
-    );
-
-    await this.dataSource.transaction(async manager => {
-      await manager.remove(session);
-    });
-    this.logger.log(`Session deleted: ${session.name}`, {
-      sessionId: id,
-      action: 'delete',
-    });
+        action: 'delete',
+      });
+    } finally {
+      // Always clear the teardown mark so a later recreate/start with this id isn't suppressed.
+      this.stoppingSessions.delete(id);
+      this.lastDispatchedStatus.delete(id);
+    }
   }
 
   async start(id: string): Promise<Session> {
     const session = await this.findOne(id);
 
+    // Reserve the slot SYNCHRONOUSLY (same tick as the has() check) so two near-simultaneous
+    // start() calls can't both pass the check and orphan an engine — the has() -> engines.set()
+    // window spans the awaited hook below. The second caller is rejected; the finally clears the
+    // reservation on success AND failure so a failed start never wedges at "already starting".
     if (this.engines.has(id)) {
       throw new BadRequestException('Session is already started');
     }
+    if (this.initializingSessions.has(id)) {
+      throw new BadRequestException('Session is already starting');
+    }
+    this.initializingSessions.add(id);
 
-    // A fresh start intentionally (re-)creates the engine — clear any stale stop/delete mark.
-    this.stoppingSessions.delete(id);
+    try {
+      // A fresh start intentionally (re-)creates the engine — clear any stale stop/delete mark.
+      this.stoppingSessions.delete(id);
 
-    // Execute hook before starting
-    await this.hookManager.execute(
-      'session:starting',
-      { sessionId: id },
-      {
+      // Execute hook before starting
+      await this.hookManager.execute(
+        'session:starting',
+        { sessionId: id },
+        {
+          sessionId: id,
+          source: 'SessionService',
+        },
+      );
+
+      // Initialize reconnect state from the (untrusted) opaque session.config — coerced + clamped
+      // so a poisoned value can't drive a NaN/immediate-relaunch storm or an unbounded loop.
+      const { maxAttempts, baseDelay } = resolveReconnectConfig(session.config);
+      this.reconnectStates.set(id, { attempts: 0, timer: null, maxAttempts, baseDelay });
+
+      await this.initializeEngine(id, session);
+
+      // A stop()/delete() may have landed while we awaited engine.initialize() — if so, tear down the
+      // engine we just registered so the session isn't resurrected to READY (mirrors the post-init
+      // guard in executeReconnect; initialize()'s callbacks can also fire async after this returns).
+      if (this.stoppingSessions.has(id)) {
+        const resurrected = this.engines.get(id);
+        if (resurrected) {
+          await this.teardownEngineSafely(id, resurrected, e => e.destroy(), 'destroy');
+          this.engines.delete(id);
+        }
+      }
+      return this.findOne(id);
+    } finally {
+      this.initializingSessions.delete(id);
+    }
+  }
+
+  /**
+   * True only while `engine` is still the live engine registered for `id`. Each callback below
+   * captures its own engine instance; once the session is stopped (engine removed from the map) or
+   * restarted/reconnected (engine replaced), a late callback from the superseded engine must not
+   * mutate the session that now belongs to a different — or no — engine. `this.engines` is the
+   * single source of truth for the active engine, so identity comparison closes both the
+   * post-stop and the stale-generation (stop→start / reconnect-replace) windows the one-shot
+   * post-init guard does not cover.
+   */
+  private isLiveEngine(id: string, engine: IWhatsAppEngine): boolean {
+    return this.engines.get(id) === engine;
+  }
+
+  /**
+   * Persist pre-connection history into the `messages` table for the chat view, without webhook/hook/ws
+   * dispatch (it predates the live session). De-duplicated by `waMessageId` so re-syncs never duplicate.
+   */
+  private async persistHistoryMessages(id: string, messages: IncomingMessage[]): Promise<void> {
+    const byId = new Map<string, IncomingMessage>();
+    for (const m of messages) {
+      // Need an id to de-dup; chatId/from/to are NOT NULL; status/story posts aren't chats.
+      if (m.id && !m.isStatusBroadcast && m.chatId && m.from && m.to) {
+        byId.set(m.id, m);
+      }
+    }
+    if (byId.size === 0) {
+      return;
+    }
+    // Chunk the dedup query: a batch can be thousands, past SQLite's bound-variable limit for IN (...).
+    const ids = [...byId.keys()];
+    const CHUNK = 400;
+    let inserted = 0;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const chunkIds = ids.slice(i, i + CHUNK);
+      const existing = await this.messageRepository.find({
+        where: { sessionId: id, waMessageId: In(chunkIds) },
+        select: ['waMessageId'],
+      });
+      const seen = new Set(existing.map(r => r.waMessageId));
+      const rows = chunkIds
+        .filter(x => !seen.has(x))
+        .map(x => {
+          const m = byId.get(x)!;
+          const metadata: Record<string, unknown> = {};
+          if (m.media) metadata.media = m.media;
+          if (m.quotedMessage) metadata.quotedMessage = m.quotedMessage;
+          const row = this.messageRepository.create({
+            sessionId: id,
+            waMessageId: m.id,
+            chatId: m.chatId,
+            from: m.from,
+            to: m.to,
+            body: m.body,
+            type: m.type,
+            direction: m.fromMe ? MessageDirection.OUTGOING : MessageDirection.INCOMING,
+            timestamp: m.timestamp,
+            status: MessageStatus.SENT,
+            metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+          });
+          // The chat panel orders by createdAt; stamp the real time so history sorts correctly.
+          if (m.timestamp) {
+            row.createdAt = new Date(m.timestamp * 1000);
+          }
+          return row;
+        });
+      if (rows.length) {
+        // Insert-or-ignore: a live onMessage insert can land between the `seen` SELECT above and this
+        // write, colliding on UNIQUE(sessionId, waMessageId). orIgnore skips the collision instead of
+        // throwing and aborting the whole batch (history is best-effort, persist-never-dispatch).
+        await this.messageRepository
+          .createQueryBuilder()
+          .insert()
+          .values(rows as unknown as QueryDeepPartialEntity<Message>[])
+          .orIgnore()
+          .execute();
+        inserted += rows.length;
+      }
+    }
+    if (inserted) {
+      this.logger.log(`Persisted ${inserted} history message(s)`, {
         sessionId: id,
-        source: 'SessionService',
-      },
-    );
-
-    // Initialize reconnect state
-    const config = session.config as {
-      maxReconnectAttempts?: number;
-      reconnectBaseDelay?: number;
-    } | null;
-    this.reconnectStates.set(id, {
-      attempts: 0,
-      timer: null,
-      maxAttempts: config?.maxReconnectAttempts ?? 5,
-      baseDelay: config?.reconnectBaseDelay ?? 5000,
-    });
-
-    await this.initializeEngine(id, session);
-    return this.findOne(id);
+        inserted,
+        action: 'history_messages_persisted',
+      });
+    }
   }
 
   private async initializeEngine(id: string, session: Session): Promise<void> {
@@ -341,11 +530,18 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     await this.updateStatus(id, SessionStatus.INITIALIZING);
 
     await engine.initialize({
-      onQRCode: (): void => {
+      onQRCode: (qr: string): void => {
+        if (!this.isLiveEngine(id, engine)) return;
         this.logger.log('QR code generated', {
           sessionId: id,
           action: 'qr_generated',
         });
+
+        void this.webhookService.dispatch(id, 'session.qr', { sessionId: id, qr });
+
+        // Push the QR to subscribed dashboard clients over the WebSocket (the `session.qr` event is
+        // advertised + consumed there, so clients can render it live instead of polling GET /qr).
+        this.eventsGateway.emitQRCode(id, qr);
 
         // Execute hook for QR event
         void this.hookManager.execute(
@@ -360,12 +556,16 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         void this.updateStatus(id, SessionStatus.QR_READY);
       },
       onReady: (phone: string, pushName: string): void => {
+        if (!this.isLiveEngine(id, engine)) return;
         this.logger.log(`Session ready: ${phone}`, {
           sessionId: id,
           phone,
           pushName,
           action: 'ready',
         });
+
+        void this.webhookService.dispatch(id, 'session.authenticated', { sessionId: id, phone, pushName });
+        this.eventsGateway.emitSessionAuthenticated(id, { phone, pushName });
 
         // Execute hook for ready event
         void this.hookManager.execute(
@@ -393,6 +593,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         });
       },
       onMessage: (message): void => {
+        if (!this.isLiveEngine(id, engine)) return;
+        // Status/Story posts arrive via the inbound path for some engines; don't persist or webhook them.
+        // Mirrors the isStatusBroadcast guard in onMessageCreate below.
+        if (message.isStatusBroadcast) {
+          return;
+        }
         this.logger.debug(`Message received from ${message.from}`, {
           sessionId: id,
           messageId: message.id,
@@ -412,7 +618,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           })
           .then(async ({ continue: shouldContinue, data: finalMessage }) => {
             if (!shouldContinue) {
-              // Plugin stopped processing (e.g., auto-reply handled it)
+              // A plugin handled the event and asked to stop the chain (continue: false).
               return;
             }
 
@@ -448,9 +654,24 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
               metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
             });
 
-            void this.messageRepository.save(dbMessage).catch(err => {
-              this.logger.error(`Failed to save incoming message ${incoming.id} to database`, String(err));
-            });
+            // De-duplicate at the source: the engine can re-fire `message` for one inbound message
+            // (#464). UNIQUE(sessionId, waMessageId) makes the insert the atomic dedup oracle — a
+            // near-simultaneous re-fire loses the race and is skipped here, so persist + webhook + WS
+            // happen exactly once. Fail-open: a non-conflict DB error still dispatches, so a real
+            // message is never dropped by a transient DB failure.
+            let isNewMessage = true;
+            try {
+              await this.messageRepository.insert(dbMessage as unknown as QueryDeepPartialEntity<Message>);
+            } catch (err) {
+              if (isUniqueConstraintError(err)) {
+                isNewMessage = false;
+              } else {
+                this.logger.error(`Failed to save incoming message ${incoming.id} to database`, String(err));
+              }
+            }
+            if (!isNewMessage) {
+              return; // duplicate re-fire — the original already persisted and dispatched
+            }
 
             // Dispatch to webhooks with potentially modified message
             void this.webhookService.dispatch(id, 'message.received', finalMessage);
@@ -459,7 +680,15 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           })
           .catch(err => this.logger.error(`onMessage handler failed for ${id}`, String(err)));
       },
+      onHistoryMessages: (messages): void => {
+        if (!this.isLiveEngine(id, engine)) return;
+        // Persist for the chat view only; no dispatch (these predate the live session).
+        void this.persistHistoryMessages(id, messages).catch(err =>
+          this.logger.error(`Failed to persist history messages for ${id}`, String(err)),
+        );
+      },
       onMessageCreate: (message): void => {
+        if (!this.isLiveEngine(id, engine)) return;
         // `message_create` fires for every message the account creates, including sends composed on a
         // linked phone — which the `message`/`onMessage` event never delivers. Incoming messages are
         // already handled by `onMessage`, so only outgoing (`fromMe`) ones produce `message.sent` here.
@@ -494,7 +723,13 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
               return;
             }
 
-            // Dispatch to webhooks with potentially modified message
+            // NOTE: unlike onMessage (incoming), this path intentionally does NOT mirror the message
+            // to the `messages` table. message_create ALSO fires for API-originated sends, which the
+            // REST send path already persists — saving here would double-persist them. Safe
+            // persistence of phone-composed sends needs a unique (sessionId, waMessageId) index +
+            // de-dup and is tracked as a separate enhancement; until then this path only webhooks/
+            // emits. So local message history reflects API sends + all inbound, but not sends
+            // composed on a linked phone.
             void this.webhookService.dispatch(id, 'message.sent', finalMessage);
             // Emit real-time event to WebSocket clients (as message.sent, not message.received)
             this.eventsGateway.emitMessageSent(id, finalMessage);
@@ -502,6 +737,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           .catch(err => this.logger.error(`onMessageCreate handler failed for ${id}`, String(err)));
       },
       onMessageAck: (messageId, status: DeliveryStatus): void => {
+        if (!this.isLiveEngine(id, engine)) return;
         this.logger.debug(`Message ack: ${messageId} -> ${status}`, {
           sessionId: id,
           messageId,
@@ -516,25 +752,44 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         // fire-and-forget writes race-safe at the DB level.
         const messageStatus = deliveryStatusToMessageStatus(status);
         if (messageStatus) {
-          void this.messageRepository
-            // Scope by sessionId: waMessageId is unique per account/chat, not global —
-            // an ack on one session must never advance a same-id row in another session.
-            .update(
-              { sessionId: id, waMessageId: messageId, status: In(ackStatusTransitionFrom(messageStatus)) },
-              { status: messageStatus },
-            )
-            .then(result => {
-              // affected:0 — the row was not advanced: either the send's 2nd save (which sets
-              // waMessageId) hasn't committed yet, or the status is already at/above the target.
-              if (result.affected === 0) {
-                this.logger.debug(`Message ack ${messageId}: no status row advanced to ${messageStatus} (${status})`, {
-                  sessionId: id,
-                  messageId,
-                  status,
-                  action: 'message_ack_noop',
-                });
-              }
+          // Scope by sessionId: waMessageId is unique per account/chat, not global — an ack on one
+          // session must never advance a same-id row in another session. The In() guard makes the
+          // UPDATE forward-only (a late/out-of-order ack can't downgrade) and idempotent on retry.
+          const advanceAck = (): Promise<number> =>
+            this.messageRepository
+              .update(
+                { sessionId: id, waMessageId: messageId, status: In(ackStatusTransitionFrom(messageStatus)) },
+                { status: messageStatus },
+              )
+              .then(result => result.affected ?? 0);
+
+          const logNoop = (): void =>
+            this.logger.debug(`Message ack ${messageId}: no status row advanced to ${messageStatus} (${status})`, {
+              sessionId: id,
+              messageId,
+              status,
+              action: 'message_ack_noop',
             });
+
+          const onAckError = (err: unknown): void =>
+            this.logger.error(`Failed to advance ack for ${messageId}`, String(err));
+
+          void advanceAck()
+            .then(affected => {
+              if (affected > 0) return;
+              // affected:0 — most likely the send's 2nd save (which writes waMessageId) hasn't committed
+              // yet, so the row isn't matchable. Each ack is one-shot (WhatsApp won't necessarily resend),
+              // so retry ONCE after a short delay to close that race rather than leave it stuck at SENT.
+              const timer = setTimeout(() => {
+                void advanceAck()
+                  .then(retried => {
+                    if (retried === 0) logNoop();
+                  })
+                  .catch(onAckError);
+              }, ACK_RECONCILE_DELAY_MS);
+              timer.unref?.();
+            })
+            .catch(onAckError);
         }
 
         // Push the live delivery/read tick to the dashboard over the websocket (neutral status).
@@ -561,8 +816,20 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             ack: deliveryStatusToAck(status),
           });
         }
+
+        // Notify plugins of the delivery/read receipt. The `message:ack` hook event was declared in
+        // the HookEvent union but never emitted, so any plugin registered for it silently never fired.
+        // Fire-and-forget: an ack is a notification with nothing downstream to cancel, so the hook's
+        // `continue` flag is moot. Delivery failures surface here as status `failed` — `message:failed`
+        // stays reserved for send-time send failures, which carry a distinct `{ error, input }` payload.
+        void this.hookManager.execute(
+          'message:ack',
+          { messageId, status, ack: deliveryStatusToAck(status) },
+          { sessionId: id, source: 'Engine' },
+        );
       },
       onMessageRevoked: (message): void => {
+        if (!this.isLiveEngine(id, engine)) return;
         this.logger.debug(`Message revoked: ${message.id}`, {
           sessionId: id,
           messageId: message.id,
@@ -585,41 +852,36 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         this.eventsGateway.emitMessageRevoked(id, revokedPayload);
       },
       onMessageReaction: (event): void => {
+        if (!this.isLiveEngine(id, engine)) return;
         this.logger.debug(`Message reaction received: ${event.messageId} -> ${event.reaction}`, {
           sessionId: id,
           messageId: event.messageId,
           action: 'message_reaction_received',
         });
 
-        void this.messageRepository
-          .findOne({ where: { sessionId: id, waMessageId: event.messageId } })
-          .then(async msg => {
-            if (!msg) return;
-            const metadata = msg.metadata || {};
-            const reactions = (metadata.reactions as Record<string, string>) || {};
-
-            if (!event.reaction) {
-              delete reactions[event.senderId];
-            } else {
-              reactions[event.senderId] = event.reaction;
-            }
-
-            metadata.reactions = reactions;
-            msg.metadata = metadata;
-            await this.messageRepository.save(msg);
-
-            this.eventsGateway.emitMessageReaction(id, { ...event, reactions });
-          })
-          .catch(err => {
-            this.logger.error(`Failed to update message reaction: ${event.messageId}`, String(err));
-          });
+        // Serialize per message so two concurrent reactions don't read the same snapshot and clobber
+        // each other on the full-row save. A prior chain's failure must not block later reactions.
+        const key = `${id}:${event.messageId}`;
+        const prior = this.reactionChains.get(key) ?? Promise.resolve();
+        const next = prior.catch(() => undefined).then(() => this.applyReaction(id, event));
+        this.reactionChains.set(key, next);
+        void next.finally(() => {
+          // Clean up only if no newer reaction chained after us, so the map can't leak per message.
+          if (this.reactionChains.get(key) === next) {
+            this.reactionChains.delete(key);
+          }
+        });
       },
       onDisconnected: (reason: string): void => {
+        if (!this.isLiveEngine(id, engine)) return;
         this.logger.warn(`Session disconnected: ${reason}`, {
           sessionId: id,
           reason,
           action: 'disconnected',
         });
+
+        void this.webhookService.dispatch(id, 'session.disconnected', { sessionId: id, reason });
+        this.eventsGateway.emitSessionDisconnected(id, { reason });
 
         // Execute hook for disconnected event
         void this.hookManager.execute(
@@ -637,6 +899,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         this.scheduleReconnect(id, session);
       },
       onStateChanged: (engineState: EngineStatus): void => {
+        if (!this.isLiveEngine(id, engine)) return;
         const statusMap: Record<EngineStatus, SessionStatus> = {
           [EngineStatus.DISCONNECTED]: SessionStatus.DISCONNECTED,
           [EngineStatus.INITIALIZING]: SessionStatus.INITIALIZING,
@@ -651,6 +914,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         }
       },
       onError: (reason: string): void => {
+        if (!this.isLiveEngine(id, engine)) return;
         this.logger.error(`Session engine failed: ${reason}`, undefined, {
           sessionId: id,
           reason,
@@ -676,6 +940,36 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     });
   }
 
+  /**
+   * Apply one reaction event to the stored message's reactions map (read-modify-write of the JSON
+   * column). Invoked through the per-message serialization chain in onMessageReaction, so concurrent
+   * reactions on the same message run sequentially and don't clobber each other.
+   */
+  private async applyReaction(id: string, event: ReactionEvent): Promise<void> {
+    try {
+      const msg = await this.messageRepository.findOne({ where: { sessionId: id, waMessageId: event.messageId } });
+      if (!msg) return;
+
+      const metadata = msg.metadata || {};
+      const reactions = (metadata.reactions as Record<string, string>) || {};
+      if (!event.reaction) {
+        delete reactions[event.senderId];
+      } else {
+        reactions[event.senderId] = event.reaction;
+      }
+      metadata.reactions = reactions;
+      msg.metadata = metadata;
+      await this.messageRepository.save(msg);
+
+      this.eventsGateway.emitMessageReaction(id, { ...event, reactions });
+      // Webhook parity with the WebSocket broadcast: same payload (event + post-apply snapshot), so a
+      // webhook-only consumer observes reactions too. Idempotency for this event is salted per dispatch.
+      void this.webhookService.dispatch(id, 'message.reaction', { ...event, reactions });
+    } catch (err) {
+      this.logger.error(`Failed to update message reaction: ${event.messageId}`, String(err));
+    }
+  }
+
   private scheduleReconnect(id: string, session: Session): void {
     const state = this.reconnectStates.get(id);
     if (!state) return;
@@ -693,8 +987,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       return;
     }
 
-    // Exponential backoff: baseDelay * 2^attempts (with jitter)
-    const delay = state.baseDelay * Math.pow(2, state.attempts) + Math.random() * 1000;
+    // Exponential backoff: baseDelay * 2^attempts (with jitter), clamped finite + within
+    // setTimeout's safe range so the timer can't overflow and fire immediately.
+    const delay = clampReconnectDelay(
+      state.baseDelay * Math.pow(2, state.attempts) + Math.random() * 1000,
+      state.baseDelay,
+    );
     state.attempts++;
 
     this.logger.log(
@@ -718,10 +1016,13 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       return;
     }
     try {
-      // Clean up old engine
+      // Clean up old engine. Time-bound the teardown: a wedged Chromium (the common reconnect
+      // trigger) makes destroy() hang, and a raw await here would stall the reconnect forever —
+      // the session would never re-init nor reach FAILED. teardownEngineSafely always resolves
+      // (after 10s on a hang), so reconnection proceeds either way.
       const oldEngine = this.engines.get(id);
       if (oldEngine) {
-        await oldEngine.destroy();
+        await this.teardownEngineSafely(id, oldEngine, e => e.destroy(), 'destroy');
         this.engines.delete(id);
       }
 
@@ -733,7 +1034,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       if (this.stoppingSessions.has(id)) {
         const resurrected = this.engines.get(id);
         if (resurrected) {
-          await resurrected.destroy();
+          await this.teardownEngineSafely(id, resurrected, e => e.destroy(), 'destroy');
           this.engines.delete(id);
         }
         return;
@@ -766,16 +1067,45 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // Cancel any reconnection attempts
     this.cancelReconnect(id);
 
+    // Disconnect the engine — time-bounded + isolated so a stuck socket can't wedge the stop; the
+    // Map is reconciled regardless. (The stop mark is intentionally left set, matching the prior
+    // behaviour: a later start() clears it; it guards against a late reconnect resurrecting the id.)
     const engine = this.engines.get(id);
-
     if (engine) {
-      await engine.disconnect();
+      await this.teardownEngineSafely(id, engine, e => e.disconnect(), 'disconnect');
       this.engines.delete(id);
     }
 
     this.logger.log(`Session stopped: ${session.name}`, {
       sessionId: id,
       action: 'stop',
+    });
+    await this.updateStatus(id, SessionStatus.DISCONNECTED);
+    return this.findOne(id);
+  }
+
+  /**
+   * Force-recover a stuck session: SIGKILL its engine's own resources (a wedged Chromium for the
+   * whatsapp-web.js engine) and tear it down, even when a normal stop()/delete() can't because the
+   * engine is hung. Mirrors stop()'s lifecycle (stop-mark + cancel-reconnect + bounded, isolated
+   * teardown + Map reconciliation) but uses the engine's forceDestroy().
+   */
+  async forceKill(id: string): Promise<Session> {
+    const session = await this.findOne(id);
+
+    // Mark as tearing down BEFORE cleanup so an in-flight reconnect can't resurrect it.
+    this.stoppingSessions.add(id);
+    this.cancelReconnect(id);
+
+    const engine = this.engines.get(id);
+    if (engine) {
+      await this.teardownEngineSafely(id, engine, e => e.forceDestroy(), 'force-destroy');
+      this.engines.delete(id);
+    }
+
+    this.logger.warn(`Session force-killed: ${session.name}`, {
+      sessionId: id,
+      action: 'force_kill',
     });
     await this.updateStatus(id, SessionStatus.DISCONNECTED);
     return this.findOne(id);
@@ -855,7 +1185,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     return phone;
   }
 
-  async getGroups(id: string): Promise<{ id: string; name: string; linkedParentJID?: string | null }[]> {
+  async getGroups(
+    id: string,
+    opts: ListOptions = {},
+  ): Promise<{ id: string; name: string; linkedParentJID?: string | null }[]> {
     await this.findOne(id); // Verify session exists
     const engine = this.engines.get(id);
 
@@ -864,14 +1197,15 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     }
 
     const groups = await engine.getGroups();
-    return groups.map(g => ({
+    const mapped = groups.map(g => ({
       id: g.id,
       name: g.name,
       linkedParentJID: g.linkedParentJID,
     }));
+    return paginate(mapped, opts.limit, opts.offset);
   }
 
-  async getChats(id: string): Promise<ChatSummary[]> {
+  async getChats(id: string, opts: ListOptions = {}): Promise<ChatSummary[]> {
     await this.findOne(id); // Verify session exists
     const engine = this.engines.get(id);
 
@@ -879,7 +1213,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       throw new BadRequestException('Session is not started');
     }
 
-    return engine.getChats();
+    // Most-recent first, then bound the response window. Sorting before the cap means a capped
+    // response is the N newest chats (what clients show first) rather than an arbitrary slice.
+    const chats = [...(await engine.getChats())].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    return paginate(chats, opts.limit, opts.offset);
   }
 
   async sendSeen(id: string, chatId: string): Promise<boolean> {
@@ -891,6 +1228,17 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     }
 
     return engine.sendSeen(chatId);
+  }
+
+  async markUnread(id: string, chatId: string): Promise<boolean> {
+    await this.findOne(id); // Verify session exists
+    const engine = this.engines.get(id);
+
+    if (!engine) {
+      throw new BadRequestException('Session is not started');
+    }
+
+    return engine.markUnread(chatId);
   }
 
   async deleteChat(id: string, chatId: string): Promise<boolean> {
@@ -924,12 +1272,19 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     });
     // Emit real-time event to connected WebSocket clients
     this.eventsGateway.emitSessionStatus(id, status);
+    // Mirror the status change to subscribed webhooks. Some engines signal one transition via both
+    // onStateChanged AND a dedicated callback (onQRCode/onDisconnected), which would POST the same
+    // status twice — dispatch only when the status actually changed from the last one we sent.
+    if (this.lastDispatchedStatus.get(id) !== status) {
+      this.lastDispatchedStatus.set(id, status);
+      void this.webhookService.dispatch(id, 'session.status', { sessionId: id, status });
+    }
   }
 
   /**
    * Get overall session statistics for multi-session monitoring
    */
-  async getStats(): Promise<{
+  async getStats(allowedSessions?: string[] | null): Promise<{
     total: number;
     active: number;
     ready: number;
@@ -937,7 +1292,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     byStatus: Record<string, number>;
     memoryUsage: { heapUsed: number; heapTotal: number; rss: number };
   }> {
-    const sessions = await this.findAll();
+    // Scope to the caller's allowedSessions so a session-restricted key cannot enumerate the count /
+    // status distribution of sessions it has no rights to (matches the scoped GET /sessions route).
+    const scope = allowedSessions && allowedSessions.length > 0 ? allowedSessions : null;
+    const sessions = await this.findAll(scope);
     const byStatus: Record<string, number> = {};
 
     for (const session of sessions) {
@@ -948,7 +1306,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
     return {
       total: sessions.length,
-      active: this.engines.size,
+      // engines is keyed by session id; a scoped key sees only its own running engines, not the global count.
+      active: scope ? [...this.engines.keys()].filter(id => scope.includes(id)).length : this.engines.size,
       ready: byStatus[SessionStatus.READY] || 0,
       disconnected: byStatus[SessionStatus.DISCONNECTED] || 0,
       byStatus,

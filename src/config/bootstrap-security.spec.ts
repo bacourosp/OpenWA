@@ -52,6 +52,14 @@ describe('isSwaggerEnabled', () => {
     expect(isSwaggerEnabled('true')).toBe(true);
     expect(isSwaggerEnabled('')).toBe(true);
   });
+  it('defaults OFF in production unless explicitly enabled (recon hygiene)', () => {
+    expect(isSwaggerEnabled(undefined, 'production')).toBe(false);
+    expect(isSwaggerEnabled('', 'production')).toBe(false);
+    expect(isSwaggerEnabled('true', 'production')).toBe(true); // explicit opt-in still honored
+    expect(isSwaggerEnabled('false', 'production')).toBe(false);
+    // non-production is unchanged (default on)
+    expect(isSwaggerEnabled(undefined, 'development')).toBe(true);
+  });
 });
 
 describe('resolveBodyLimit', () => {
@@ -109,6 +117,22 @@ describe('assertNoDefaultSecretsInProduction', () => {
     expect(() => assertNoDefaultSecretsInProduction({ nodeEnv: 'production', apiMasterKey: 'dev-master-key' })).toThrow(
       /API_MASTER_KEY/,
     );
+  });
+
+  it('refuses prod when ALLOW_DEV_API_KEY=true (it seeds the public dev-admin-key as ADMIN)', () => {
+    expect(() => assertNoDefaultSecretsInProduction({ nodeEnv: 'production', allowDevApiKey: 'true' })).toThrow(
+      /ALLOW_DEV_API_KEY/,
+    );
+  });
+
+  it('refuses prod with API_MASTER_KEY set to the well-known dev-admin-key', () => {
+    expect(() => assertNoDefaultSecretsInProduction({ nodeEnv: 'production', apiMasterKey: 'dev-admin-key' })).toThrow(
+      /API_MASTER_KEY/,
+    );
+  });
+
+  it('allows ALLOW_DEV_API_KEY=true outside production (the dev opt-in still works)', () => {
+    expect(() => assertNoDefaultSecretsInProduction({ nodeEnv: 'development', allowDevApiKey: 'true' })).not.toThrow();
   });
 
   it('allows the default sqlite + local-storage prod setup (no secrets needed)', () => {

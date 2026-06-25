@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, Optional, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { FindManyOptions, In, Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -10,9 +10,12 @@ import { CreateWebhookDto, UpdateWebhookDto } from './dto';
 import { createLogger } from '../../common/services/logger.service';
 import { QUEUE_NAMES } from '../queue/queue-names';
 import { generateIdempotencyKey, generateDeliveryId } from './utils/idempotency.util';
+import { evaluateFilters } from './filters/filter-evaluator';
+import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
+import { userPart } from '../../engine/identity/wa-id';
 import {
   assertSafeFetchUrl,
-  assertNoRedirect,
+  withSafeFetch,
   isSsrfProtectionEnabled,
   SsrfBlockedError,
 } from '../../common/security/ssrf-guard';
@@ -49,6 +52,8 @@ export class WebhookService {
     private readonly configService: ConfigService,
     private readonly hookManager: HookManager,
     @Optional()
+    private readonly lidMappingStore?: LidMappingStoreService,
+    @Optional()
     @InjectQueue(QUEUE_NAMES.WEBHOOK)
     private readonly webhookQueue?: Queue<WebhookJobData>,
   ) {
@@ -80,6 +85,7 @@ export class WebhookService {
       events: dto.events || ['message.received'],
       secret: dto.secret || null,
       headers: dto.headers || {},
+      filters: dto.filters ?? null,
       retryCount: dto.retryCount ?? 3,
     });
 
@@ -93,22 +99,28 @@ export class WebhookService {
     });
   }
 
-  async findAll(): Promise<Webhook[]> {
-    return this.webhookRepository.find({
-      order: { createdAt: 'DESC' },
-    });
+  async findAll(allowedSessions?: string[] | null): Promise<Webhook[]> {
+    // A session-restricted key only sees its own sessions' webhooks; an unrestricted key
+    // (null/empty allowlist, e.g. ADMIN) sees all — mirroring the ApiKeyGuard allowedSessions model.
+    const options: FindManyOptions<Webhook> = { order: { createdAt: 'DESC' } };
+    if (allowedSessions && allowedSessions.length > 0) {
+      options.where = { sessionId: In(allowedSessions) };
+    }
+    return this.webhookRepository.find(options);
   }
 
-  async findOne(id: string): Promise<Webhook> {
-    const webhook = await this.webhookRepository.findOne({ where: { id } });
+  async findOne(sessionId: string, id: string): Promise<Webhook> {
+    // Scope by the URL's sessionId so one session cannot read/act on another's webhook by id.
+    // A wrong-session id resolves to not-found (no cross-session existence oracle).
+    const webhook = await this.webhookRepository.findOne({ where: { id, sessionId } });
     if (!webhook) {
       throw new NotFoundException(`Webhook with id '${id}' not found`);
     }
     return webhook;
   }
 
-  async update(id: string, dto: UpdateWebhookDto): Promise<Webhook> {
-    const webhook = await this.findOne(id);
+  async update(sessionId: string, id: string, dto: UpdateWebhookDto): Promise<Webhook> {
+    const webhook = await this.findOne(sessionId, id);
 
     if (dto.url !== undefined) {
       await this.validateWebhookUrl(dto.url);
@@ -119,19 +131,20 @@ export class WebhookService {
     // not a stored blank that silently disables signing while looking configured.
     if (dto.secret !== undefined) webhook.secret = dto.secret || null;
     if (dto.headers !== undefined) webhook.headers = dto.headers;
+    if (dto.filters !== undefined) webhook.filters = dto.filters;
     if (dto.active !== undefined) webhook.active = dto.active;
     if (dto.retryCount !== undefined) webhook.retryCount = dto.retryCount;
 
     return this.webhookRepository.save(webhook);
   }
 
-  async delete(id: string): Promise<void> {
-    const webhook = await this.findOne(id);
+  async delete(sessionId: string, id: string): Promise<void> {
+    const webhook = await this.findOne(sessionId, id);
     await this.webhookRepository.remove(webhook);
   }
 
   async test(sessionId: string, webhookId: string): Promise<{ success: boolean; statusCode?: number; error?: string }> {
-    const webhook = await this.findOne(webhookId);
+    const webhook = await this.findOne(sessionId, webhookId);
 
     const testPayload: WebhookPayload = {
       event: 'test',
@@ -162,26 +175,19 @@ export class WebhookService {
       headers['X-OpenWA-Signature'] = this.generateSignature(body, webhook.secret);
     }
 
-    const ssrfProtected = isSsrfProtectionEnabled();
     try {
-      if (ssrfProtected) {
-        await assertSafeFetchUrl(webhook.url);
-      }
-      const response = await fetch(webhook.url, {
-        method: 'POST',
-        headers,
-        body,
-        signal: AbortSignal.timeout(10000),
-        redirect: ssrfProtected ? 'manual' : 'follow',
-      });
-      if (ssrfProtected) {
-        assertNoRedirect(response, webhook.url);
-      }
-
-      return {
-        success: response.ok,
-        statusCode: response.status,
-      };
+      return await withSafeFetch(
+        webhook.url,
+        {
+          method: 'POST',
+          headers,
+          body,
+          // Use the configured WEBHOOK_TIMEOUT (single source of truth across queued/test/direct paths).
+          signal: AbortSignal.timeout(this.configService.get<number>('webhook.timeout', 10000)),
+        },
+        response => ({ success: response.ok, statusCode: response.status }),
+        { guard: isSsrfProtectionEnabled() },
+      );
     } catch (error) {
       return {
         success: false,
@@ -206,10 +212,18 @@ export class WebhookService {
       return;
     }
 
-    const matchingWebhooks = webhooks.filter(w => w.events.includes(event) || w.events.includes('*'));
+    // Resolve a lid actor to its phone through the persistent table so a phone filter matches a
+    // lid-addressed sender (e.g. an unresolved @lid group participant). Absent store -> no resolution.
+    const resolveLid = (jid: string): string | null => this.lidMappingStore?.getCached(userPart(jid)) ?? null;
+    const matchingWebhooks = webhooks.filter(
+      w => (w.events.includes(event) || w.events.includes('*')) && evaluateFilters(w.filters, event, data, resolveLid),
+    );
 
-    // Generate idempotency key (same for all webhooks receiving this event)
-    const idempotencyKey = generateIdempotencyKey(event, { ...data, sessionId });
+    // Generate idempotency key (same for all webhooks receiving this event). occurredAt is captured
+    // once here and reused for every retry of this dispatch, so recurring lifecycle events get a
+    // distinct-per-occurrence key while retries of the same event stay stable.
+    const occurredAt = new Date().toISOString();
+    const idempotencyKey = generateIdempotencyKey(event, { ...data, sessionId }, occurredAt);
 
     // Dispatch to all matching webhooks
     for (const webhook of matchingWebhooks) {
@@ -240,8 +254,9 @@ export class WebhookService {
         continue;
       }
 
-      // Use potentially modified payload
-      const finalPayload = (hookResult as { payload: WebhookPayload }).payload;
+      // Use the plugin-modified payload, falling back to the original if a before-hook returned a
+      // result without a `payload` key — otherwise we'd POST an `undefined` body.
+      const finalPayload = (hookResult as { payload?: WebhookPayload }).payload ?? payload;
 
       // Build headers — custom headers FIRST so the system headers below always win.
       const headers: Record<string, string> = {
@@ -256,24 +271,28 @@ export class WebhookService {
 
       // Use queue if available, otherwise fallback to direct delivery
       if (this.queueEnabled && this.webhookQueue) {
-        const signature = webhook.secret ? this.generateSignature(JSON.stringify(finalPayload), webhook.secret) : '';
-
-        if (webhook.secret) {
-          headers['X-OpenWA-Signature'] = signature;
-        }
-
-        const jobData: WebhookJobData = {
-          webhookId: webhook.id,
-          url: webhook.url,
-          event,
-          payload: finalPayload,
-          signature,
-          headers,
-          attempt: 1,
-          maxRetries: webhook.retryCount,
-        };
-
         try {
+          // finalPayload comes from the (untrusted) webhook:before hook result, so JSON.stringify can
+          // throw (BigInt / circular). Keep serialization + signing INSIDE the try so a poisoned payload
+          // is caught here (one webhook dropped + logged) instead of aborting the whole dispatch loop
+          // and rejecting the fire-and-forget dispatch() promise.
+          const signature = webhook.secret ? this.generateSignature(JSON.stringify(finalPayload), webhook.secret) : '';
+
+          if (webhook.secret) {
+            headers['X-OpenWA-Signature'] = signature;
+          }
+
+          const jobData: WebhookJobData = {
+            webhookId: webhook.id,
+            url: webhook.url,
+            event,
+            payload: finalPayload,
+            signature,
+            headers,
+            attempt: 1,
+            maxRetries: webhook.retryCount,
+          };
+
           await this.webhookQueue.add(`webhook-${webhook.id}`, jobData, {
             attempts: webhook.retryCount,
             backoff: {
@@ -363,24 +382,21 @@ export class WebhookService {
       headers['X-OpenWA-Signature'] = this.generateSignature(body, webhook.secret);
     }
 
-    const ssrfProtected = isSsrfProtectionEnabled();
     try {
-      if (ssrfProtected) {
-        await assertSafeFetchUrl(webhook.url);
-      }
-      const response = await fetch(webhook.url, {
-        method: 'POST',
-        headers,
-        body,
-        signal: AbortSignal.timeout(this.configService.get<number>('webhook.timeout', 10000)),
-        redirect: ssrfProtected ? 'manual' : 'follow',
-      });
-      if (ssrfProtected) {
-        assertNoRedirect(response, webhook.url);
-      }
+      const { ok, status, statusText } = await withSafeFetch(
+        webhook.url,
+        {
+          method: 'POST',
+          headers,
+          body,
+          signal: AbortSignal.timeout(this.configService.get<number>('webhook.timeout', 10000)),
+        },
+        response => ({ ok: response.ok, status: response.status, statusText: response.statusText }),
+        { guard: isSsrfProtectionEnabled() },
+      );
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      if (!ok) {
+        throw new Error(`HTTP ${status}: ${statusText}`);
       }
 
       // Update last triggered timestamp

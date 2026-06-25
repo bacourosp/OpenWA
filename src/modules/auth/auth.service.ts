@@ -1,9 +1,11 @@
 import { Injectable, NotFoundException, UnauthorizedException, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { createHash, randomBytes } from 'crypto';
-import { existsSync, writeFileSync, readFileSync } from 'fs';
+import { randomBytes } from 'crypto';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { writeSecretFile } from '../../common/utils/secret-file';
+import { hashApiKey } from './api-key-hash';
 import { ApiKey, ApiKeyRole } from './entities/api-key.entity';
 import { CreateApiKeyDto, UpdateApiKeyDto } from './dto';
 import { createLogger } from '../../common/services/logger.service';
@@ -53,9 +55,9 @@ export class AuthService implements OnModuleInit {
       await this.seedApiKey(displayKey, 'Default Admin Key', ApiKeyRole.ADMIN);
       isNewKey = true;
 
-      // Save raw key to file for startup script to read
+      // Save raw key to file for startup script to read (owner-only — it's the raw admin key).
       try {
-        writeFileSync(API_KEY_FILE, displayKey, 'utf-8');
+        writeSecretFile(API_KEY_FILE, displayKey);
       } catch (err) {
         this.logger.warn('Could not save API key file', { error: String(err) });
       }
@@ -75,7 +77,8 @@ export class AuthService implements OnModuleInit {
 
     // Always show the welcome banner on startup
     const apiBaseUrl = process.env.BASE_URL || `http://localhost:${process.env.PORT || 2785}`;
-    const dashboardUrl = process.env.DASHBOARD_URL || `http://localhost:${process.env.DASHBOARD_PORT || 2886}`;
+    // The dashboard is served by NestJS at the same origin as the API now, so default to it.
+    const dashboardUrl = process.env.DASHBOARD_URL || apiBaseUrl;
 
     this.logger.log('');
     this.logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
@@ -242,7 +245,7 @@ export class AuthService implements OnModuleInit {
   }
 
   private hashKey(rawKey: string): string {
-    return createHash('sha256').update(rawKey).digest('hex');
+    return hashApiKey(rawKey, process.env.API_KEY_PEPPER);
   }
 
   private isIpAllowed(clientIp: string, allowedIps: string[]): boolean {

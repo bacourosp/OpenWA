@@ -1,4 +1,18 @@
 // WhatsApp Engine Interface - Abstract layer for WA engines
+//
+// Identity contract (the engine boundary is an anti-corruption layer for WhatsApp's id dialects):
+// every JID an engine EMITS in a neutral field (`from` / `to` / `chatId` / `author` / contact + chat
+// `id`, etc.) is in the NEUTRAL dialect, so application code never has to know which engine produced
+// it. The neutral dialect is small:
+//   - `<phone>@c.us`  a user known by phone (the raw `@s.whatsapp.net` form folds into this)
+//   - `<id>@g.us`     a group
+//   - `<lid>@lid`     a user known ONLY by privacy id - phone genuinely unknown (a first-class state)
+//   - `status@broadcast` / `<id>@newsletter` / `<id>@broadcast`  special channels
+//   - never `@s.whatsapp.net`, never a `:device` suffix
+// Resolution rule: prefer `@c.us` (resolve a lid to its phone when the mapping is known), fall back to
+// `@lid` only when it can't be resolved. See `engine/identity/wa-id.ts` for the shared implementation.
+// (Ids the engine ACCEPTS - e.g. `sendTextMessage(chatId)` - may be neutral; the adapter de-normalizes
+// to its own dialect. Full inbound + outbound conformance is being rolled out per-engine.)
 
 export enum EngineStatus {
   DISCONNECTED = 'disconnected',
@@ -57,6 +71,8 @@ export interface IncomingMessage {
   isStatusBroadcast?: boolean;
   /** For group messages, the WID of the participant who actually sent it (`from` is the group JID there). */
   author?: string;
+  /** WIDs @mentioned in the message (empty/absent when none). Surfaced for command targeting. */
+  mentionedIds?: string[];
   /**
    * Set by the adapter when the sender is identified by a privacy id (e.g. a WhatsApp `@lid`) rather
    * than a phone number, so engine-neutral code can decide whether to attempt phone resolution without
@@ -69,15 +85,16 @@ export interface IncomingMessage {
    * populated for `isLidSender` messages.
    */
   senderPhone?: string | null;
-  /** Sender display info, best-effort from the WhatsApp Web contact cache. */
-  contact?: {
-    name?: string;
-    pushName?: string;
-  };
+  /** Sender contact info, best-effort from the WhatsApp Web cache. Sync fields only (no network). */
+  contact?: MessageContact;
   media?: {
     mimetype: string;
     filename?: string;
-    data?: string; // base64
+    data?: string; // base64; absent when the payload was omitted (see `omitted`)
+    /** True when the media exceeded the inbound size cap and the blob was dropped (envelope kept). */
+    omitted?: boolean;
+    /** Decoded byte size of the media; always set when `omitted` is true. */
+    sizeBytes?: number;
   };
   quotedMessage?: {
     id: string;
@@ -90,6 +107,37 @@ export interface IncomingMessage {
     address?: string;
     url?: string;
   };
+}
+
+/**
+ * Synchronous (already-resolved, no network call) fields of a sender contact, surfaced on
+ * {@link IncomingMessage}. Async getters (profile pic / about / formatted number) are intentionally
+ * NOT included — they hit WhatsApp servers per message and risk rate-limit/ban. All optional; a key
+ * is present only when the engine populated it.
+ */
+export interface MessageContact {
+  /** Sender JID (`…@c.us` or a `…@lid` privacy id). */
+  id?: string;
+  /** Phone digits, best-effort. For `@lid` senders the authoritative number is `IncomingMessage.senderPhone`. */
+  number?: string;
+  name?: string;
+  pushName?: string;
+  shortName?: string;
+  /** whatsapp-web.js contact type token. */
+  type?: string;
+  /** Saved in the account's address book. */
+  isMyContact?: boolean;
+  /** Is a WhatsApp user. */
+  isWAContact?: boolean;
+  isBusiness?: boolean;
+  isEnterprise?: boolean;
+  /** Business verified name. */
+  verifiedName?: string;
+  /** Business verification level. */
+  verifiedLevel?: number;
+  isBlocked?: boolean;
+  /** Label IDs (CRM). Names are not resolved — that would need a network call. */
+  labels?: string[];
 }
 
 export interface Contact {
@@ -312,6 +360,11 @@ export interface EngineEventCallbacks {
   onMessageAck?: (messageId: string, status: DeliveryStatus) => void;
   onMessageRevoked?: (message: RevokedMessage) => void;
   onMessageReaction?: (event: ReactionEvent) => void;
+  /**
+   * Bulk historical messages from an engine's initial sync (e.g. Baileys `messaging-history.set`).
+   * They predate the live session, so consumers persist them for the chat view but must not dispatch.
+   */
+  onHistoryMessages?: (messages: IncomingMessage[]) => void;
   onDisconnected?: (reason: string) => void;
   onStateChanged?: (state: EngineStatus) => void;
   /**
@@ -330,6 +383,10 @@ export interface IWhatsAppEngine {
   disconnect(): Promise<void>; // Closes browser but keeps session (can reconnect without QR)
   logout(): Promise<void>; // Logs out and clears session data (requires QR scan again)
   destroy(): Promise<void>;
+  // Force-kill THIS engine's own resources immediately (e.g. SIGKILL a wedged Chromium for a stuck
+  // session), then best-effort graceful teardown — used to recover a session that destroy() can't.
+  // Each adapter kills only its own resources (never a process-wide pkill).
+  forceDestroy(): Promise<void>;
 
   // Status
   getStatus(): EngineStatus;
@@ -432,6 +489,7 @@ export interface IWhatsAppEngine {
   // Chats
   getChats(): Promise<ChatSummary[]>;
   sendSeen(chatId: string): Promise<boolean>;
+  markUnread(chatId: string): Promise<boolean>;
   deleteChat(chatId: string): Promise<boolean>;
   /**
    * Send a typing/recording presence indicator to a chat, or clear it (`paused`).

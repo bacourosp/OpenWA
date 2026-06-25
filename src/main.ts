@@ -1,8 +1,9 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
-import { AppModule } from './app.module';
+import { AppModule, DASHBOARD_DIST, dashboardServingEnabled, dashboardBuildPresent } from './app.module';
 import { ShutdownService } from './common/services/shutdown.service';
 import { LoggerService, LogLevel, createLogger } from './common/services/logger.service';
 import { createSwaggerConfig } from './config/swagger.config';
@@ -15,6 +16,8 @@ import {
 import { BullBoardAuthMiddleware } from './common/security/bull-board-auth.middleware';
 import { AuthService } from './modules/auth/auth.service';
 import { Request, Response, NextFunction, json, urlencoded } from 'express';
+import { writeSecretFile } from './common/utils/secret-file';
+import { clearBlankEnv, BLANK_SHADOWED_ENV_KEYS } from './config/env-precedence';
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -35,6 +38,25 @@ const dataDir = path.dirname(generatedEnvPath);
 if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
 }
+
+// Tighten any pre-existing secret files written before per-file 0600 perms (best-effort) — the
+// generated .env holds S3/DB/Redis secrets and .api-key holds the raw admin key.
+for (const secret of [generatedEnvPath, path.resolve(dataDir, '.api-key')]) {
+  if (fs.existsSync(secret)) {
+    try {
+      fs.chmodSync(secret, 0o600);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
+// A compose `- KEY=${KEY:-}` line forwards a real operator value into the container but renders an
+// empty value when none is set. An empty process.env.KEY would still block .env / .env.generated
+// (loaded below with override:false) from supplying one, silently shadowing the dashboard's saved
+// value — so treat a blank value as unset for every dashboard-managed, blank-forwarded key (engine
+// selection and the external-Postgres password).
+clearBlankEnv(process.env, BLANK_SHADOWED_ENV_KEYS);
 
 // 2. User-managed .env (does not override real process env)
 if (fs.existsSync(userEnvPath)) {
@@ -70,7 +92,7 @@ STORAGE_PATH=./data/media
 
 # Docker Profiles: none (minimal setup)
 `;
-  fs.writeFileSync(generatedEnvPath, minimalConfig);
+  writeSecretFile(generatedEnvPath, minimalConfig);
   console.log('[Bootstrap] Created default configuration at:', generatedEnvPath);
   dotenv.config({ path: generatedEnvPath, override: false });
 }
@@ -96,9 +118,12 @@ async function bootstrap() {
     databaseType: process.env.DATABASE_TYPE,
     databasePassword: process.env.DATABASE_PASSWORD,
     storageType: process.env.STORAGE_TYPE,
-    s3AccessKey: process.env.S3_ACCESS_KEY,
-    s3SecretKey: process.env.S3_SECRET_KEY,
+    // Mirror storage.service's canonical-with-legacy fallback so the guard inspects the var the app
+    // actually uses (it reads S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY first).
+    s3AccessKey: process.env.S3_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY,
+    s3SecretKey: process.env.S3_SECRET_ACCESS_KEY || process.env.S3_SECRET_KEY,
     apiMasterKey: process.env.API_MASTER_KEY,
+    allowDevApiKey: process.env.ALLOW_DEV_API_KEY,
   });
 
   // Disable Nest's default body parser so we can set an explicit size cap below.
@@ -132,11 +157,18 @@ async function bootstrap() {
       contentSecurityPolicy: {
         directives: {
           defaultSrc: ["'self'"],
-          styleSrc: ["'self'", "'unsafe-inline'"],
+          // The bundled dashboard pulls webfonts from Google Fonts (CSS from fonts.googleapis.com,
+          // font files from fonts.gstatic.com). Now that NestJS serves the dashboard under this CSP,
+          // allow those origins or the @import'd fonts are blocked and the UI falls back to system fonts.
+          styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
           scriptSrc: ["'self'"],
           imgSrc: ["'self'", 'data:', 'https:'],
+          // Chat media (voice notes, video) is served to the dashboard as data: URIs. Without an
+          // explicit media-src, <audio>/<video> fall back to default-src 'self' and are blocked.
+          // Mirror imgSrc so audio/video render the same way images already do.
+          mediaSrc: ["'self'", 'data:', 'blob:', 'https:'],
           connectSrc: ["'self'"],
-          fontSrc: ["'self'"],
+          fontSrc: ["'self'", 'https://fonts.gstatic.com'],
           objectSrc: ["'none'"],
           upgradeInsecureRequests: process.env.NODE_ENV === 'production' ? [] : null,
         },
@@ -200,8 +232,10 @@ async function bootstrap() {
     }),
   );
 
-  // Swagger documentation (gated by ENABLE_SWAGGER; default on)
-  if (isSwaggerEnabled(process.env.ENABLE_SWAGGER)) {
+  // Swagger documentation. ENABLE_SWAGGER wins; otherwise default on outside production, off in
+  // production (the API schema is reconnaissance surface — production opts in with ENABLE_SWAGGER=true).
+  const swaggerEnabled = isSwaggerEnabled(process.env.ENABLE_SWAGGER, process.env.NODE_ENV);
+  if (swaggerEnabled) {
     const config = createSwaggerConfig();
     const document = SwaggerModule.createDocument(app, config);
     SwaggerModule.setup('api/docs', app, document);
@@ -211,7 +245,7 @@ async function bootstrap() {
   // @bull-board/nestjs as raw Express middleware that the global ApiKeyGuard
   // does not cover; registering this before app.listen() ensures it runs ahead
   // of the Bull Board router. Requires a valid ADMIN API key.
-  const bullBoardAuth = new BullBoardAuthMiddleware(app.get(AuthService));
+  const bullBoardAuth = new BullBoardAuthMiddleware(app.get(AuthService), app.get(ConfigService));
   app.use('/api/admin/queues', (req: Request, res: Response, next: NextFunction) => {
     void bullBoardAuth.use(req, res, next);
   });
@@ -220,7 +254,22 @@ async function bootstrap() {
   await app.listen(port);
 
   console.log(`🚀 OpenWA is running on: http://localhost:${port}`);
-  console.log(`📚 Swagger docs: http://localhost:${port}/api/docs`);
+  if (swaggerEnabled) {
+    console.log(`📚 Swagger docs: http://localhost:${port}/api/docs`);
+  }
+
+  // Make the dashboard-serving outcome explicit so a missing build (no UI on `/`)
+  // is obvious instead of a silent 404.
+  if (!dashboardServingEnabled) {
+    console.log('🖥️  Dashboard: serving disabled (SERVE_DASHBOARD=false); API only');
+  } else if (dashboardBuildPresent) {
+    console.log(`🖥️  Dashboard: serving bundled UI at http://localhost:${port}`);
+  } else {
+    console.warn(
+      `⚠️  Dashboard: no build at ${DASHBOARD_DIST} - UI disabled (API still serves /api). ` +
+        'Run `npm run build:all` to bundle it, or use the Vite dev server (`npm run dev`).',
+    );
+  }
 }
 
 void bootstrap();

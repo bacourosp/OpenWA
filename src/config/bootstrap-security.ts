@@ -33,9 +33,15 @@ export function resolveCorsPolicy(corsOriginsEnv?: string, nodeEnv?: string): Co
   };
 }
 
-/** Swagger UI is served unless ENABLE_SWAGGER=false (default on, backward compatible). */
-export function isSwaggerEnabled(enableSwaggerEnv?: string): boolean {
-  return enableSwaggerEnv !== 'false';
+/**
+ * Whether to serve the Swagger UI (/api/docs). An explicit ENABLE_SWAGGER wins ('true'/'false').
+ * When unset, it defaults ON outside production but OFF in production — the public API schema is
+ * reconnaissance surface, so production must opt in with ENABLE_SWAGGER=true.
+ */
+export function isSwaggerEnabled(enableSwaggerEnv?: string, nodeEnv?: string): boolean {
+  if (enableSwaggerEnv === 'true') return true;
+  if (enableSwaggerEnv === 'false') return false;
+  return nodeEnv !== 'production';
 }
 
 /** Request body-size cap (DoS hardening). Default is media-aware (base64 sends ride in the JSON body). */
@@ -50,6 +56,7 @@ const FORBIDDEN_PROD_SECRETS = new Set([
   'minioadmin',
   'your-secure-password',
   'dev-master-key',
+  'dev-admin-key',
   'changeme',
   'change-me',
   'password',
@@ -65,6 +72,8 @@ export interface SecretCheckEnv {
   s3AccessKey?: string;
   s3SecretKey?: string;
   apiMasterKey?: string;
+  /** ALLOW_DEV_API_KEY — when 'true' it seeds the well-known public `dev-admin-key` as an ADMIN credential. */
+  allowDevApiKey?: string;
 }
 
 /**
@@ -89,6 +98,11 @@ export function assertNoDefaultSecretsInProduction(env: SecretCheckEnv): void {
   // API_MASTER_KEY is optional, but if provided it must not be a known default.
   if (env.apiMasterKey && FORBIDDEN_PROD_SECRETS.has(env.apiMasterKey.trim().toLowerCase())) {
     problems.push('API_MASTER_KEY');
+  }
+  // ALLOW_DEV_API_KEY=true seeds the publicly-documented `dev-admin-key` as an ADMIN credential
+  // (when no API_MASTER_KEY is set) — never allow that opt-in to be carried into production.
+  if (env.allowDevApiKey === 'true') {
+    problems.push('ALLOW_DEV_API_KEY (seeds the public dev-admin-key)');
   }
 
   if (problems.length > 0) {

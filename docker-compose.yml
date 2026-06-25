@@ -27,24 +27,6 @@ services:
       - 'com.openwa.service=docker-proxy'
       - 'com.openwa.core=true'
 
-  # ===== CORE: Traefik Reverse Proxy =====
-  traefik:
-    image: traefik:v3.0
-    container_name: openwa-traefik
-    profiles: ['with-proxy', 'full']
-    restart: unless-stopped
-    networks:
-      - openwa-network
-    ports:
-      - '127.0.0.1:${DASHBOARD_PORT:-2886}:80'
-      - '127.0.0.1:8080:8080' # Traefik dashboard
-    volumes:
-      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
-      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
-    labels:
-      - 'com.openwa.service=proxy'
-      - 'com.openwa.core=true'
-
   # ===== CORE: OpenWA Backend API =====
   openwa-api:
     build:
@@ -52,7 +34,7 @@ services:
       dockerfile: Dockerfile
     container_name: openwa-api
     restart: unless-stopped
-    # App network for datastores/traefik/dashboard + the isolated network to reach
+    # App network for datastores + the isolated network to reach
     # docker-proxy (DOCKER_HOST). createService() in docker.service.ts attaches
     # orchestrated containers to the literal `openwa-network`, so its name is fixed.
     networks:
@@ -106,20 +88,26 @@ services:
       # postgres service requires it (:?) when that profile is active.
       - DATABASE_PASSWORD=${DATABASE_PASSWORD:-}
       - DATABASE_SYNCHRONIZE=${DATABASE_SYNCHRONIZE:-false}
-      # Engine
-      - ENGINE_TYPE=${ENGINE_TYPE:-whatsapp-web.js}
-      - SESSION_DATA_PATH=/app/data/sessions
+      # Engine. Forwarded empty by default so the dashboard (Infrastructure > Engine) selects the
+      # active engine via data/.env.generated (defaults to whatsapp-web.js); main.ts treats a blank
+      # ENGINE_TYPE as unset, so .env.generated wins. Set ENGINE_TYPE in your .env/host to pin an
+      # engine (e.g. baileys) — a real value flows through here and keeps top precedence.
+      - ENGINE_TYPE=${ENGINE_TYPE:-}
+      - SESSION_DATA_PATH=${SESSION_DATA_PATH:-/app/data/sessions}
       - PUPPETEER_HEADLESS=${PUPPETEER_HEADLESS:-true}
       - PUPPETEER_ARGS=${PUPPETEER_ARGS:---no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu}
-      # Pin the WhatsApp Web version if a session hangs at "authenticating" after scanning the QR
-      # (whatsapp-web.js 1.34.x can stall on an incompatible auto-selected WA-Web version, #251/#273).
-      # Empty = auto-select (default). Set WWEBJS_WEB_VERSION in .env to a known-good version — see
-      # docs/12-troubleshooting-faq.md. (Without this line the var in .env never reaches the container.)
+      # Optional WhatsApp Web version override. Leave empty for whatsapp-web.js auto-selection.
+      # If a session hangs at "authenticating", set WWEBJS_WEB_VERSION to a known-good cached build
+      # from wppconnect-team/wa-version; latest|auto|off also forces auto-selection.
       - WWEBJS_WEB_VERSION=${WWEBJS_WEB_VERSION:-}
       - WWEBJS_WEB_VERSION_REMOTE_PATH=${WWEBJS_WEB_VERSION_REMOTE_PATH:-}
+      # Raise whatsapp-web.js's first-boot init wait (default 30000ms) on slow boots — e.g. WSL2 or
+      # low-resource hosts where the QR can time out before WA Web loads. Empty = default; see
+      # docs/12-troubleshooting-faq.md. (Without this line the var in .env never reaches the container.)
+      - WWEBJS_AUTH_TIMEOUT_MS=${WWEBJS_AUTH_TIMEOUT_MS:-}
       # Storage
       - STORAGE_TYPE=${STORAGE_TYPE:-local}
-      - STORAGE_LOCAL_PATH=/app/data/media
+      - STORAGE_LOCAL_PATH=${STORAGE_LOCAL_PATH:-/app/data/media}
       - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
       - S3_ACCESS_KEY=${S3_ACCESS_KEY:-}
       - S3_SECRET_KEY=${S3_SECRET_KEY:-}
@@ -137,7 +125,7 @@ services:
       - RATE_LIMIT_MAX=${RATE_LIMIT_MAX:-100}
       # Plugins
       - PLUGINS_ENABLED=${PLUGINS_ENABLED:-true}
-      - PLUGINS_DIR=/app/data/plugins
+      - PLUGINS_DIR=${PLUGINS_DIR:-/app/data/plugins}
       # Security
       - API_MASTER_KEY=${API_MASTER_KEY:-}
       # Docker socket proxy (openwa-api never touches /var/run/docker.sock directly)
@@ -170,30 +158,15 @@ services:
       - 'com.openwa.service=api'
       - 'com.openwa.core=true'
 
-  # ===== CORE: Dashboard Frontend =====
-  dashboard:
-    build:
-      context: ./dashboard
-      dockerfile: Dockerfile.traefik
-    container_name: openwa-dashboard
-    profiles: ['with-dashboard', 'full']
-    restart: unless-stopped
-    # App network only — the dashboard must NOT be able to reach docker-proxy:2375 (H6).
-    networks:
-      - openwa-network
-    expose:
-      - '80'
-    depends_on:
-      - openwa-api
-    labels:
-      - 'com.openwa.service=dashboard'
-      - 'com.openwa.core=true'
+  # The dashboard SPA is now bundled into the openwa-api image and served by NestJS on the
+  # same port (2785) — there is no separate dashboard container. Reach it at the openwa-api
+  # port directly; put your own TLS reverse proxy (nginx/Caddy/cloud LB) in front if needed.
 
   # ===== OPTIONAL: Built-in PostgreSQL =====
   postgres:
     image: postgres:16-alpine
     container_name: openwa-postgres
-    profiles: ['postgres']
+    profiles: ['postgres', 'full']
     restart: unless-stopped
     networks:
       - openwa-network
@@ -221,7 +194,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: openwa-redis
-    profiles: ['redis']
+    profiles: ['redis', 'full']
     restart: unless-stopped
     networks:
       - openwa-network
@@ -243,7 +216,7 @@ services:
   minio:
     image: minio/minio
     container_name: openwa-minio
-    profiles: ['minio']
+    profiles: ['minio', 'full']
     restart: unless-stopped
     networks:
       - openwa-network
@@ -280,8 +253,8 @@ volumes:
     driver: local
 
 networks:
-  # Application network — datastores, traefik, dashboard, and openwa-api. Keep the
-  # name `openwa-network`: docker.service.ts attaches orchestrated containers to it by literal name.
+  # Application network — datastores and openwa-api. Keep the name `openwa-network`:
+  # docker.service.ts attaches orchestrated containers to it by literal name.
   openwa-network:
     name: openwa-network
   # Isolated network for the Docker socket proxy. `internal: true` means no external

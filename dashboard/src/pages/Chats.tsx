@@ -3,6 +3,7 @@ import { Trans, useTranslation } from 'react-i18next';
 import {
   Search,
   Send,
+  ArrowLeft,
   Loader2,
   User,
   Users,
@@ -23,6 +24,7 @@ import {
   type ChatMessage,
   type MessageType,
 } from '../services/api';
+import { mapEngineHistoryMessage, mergeChatMessages } from '../utils/chatMessages';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { useRole } from '../hooks/useRole';
@@ -95,7 +97,7 @@ export function Chats() {
   const { t } = useTranslation();
   useDocumentTitle(t('nav.chats'));
   const { canWrite } = useRole();
-  const toast = useToast();
+  const { error: showErrorToast, warning: showWarningToast } = useToast();
 
   // Sessions list & active session
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -144,13 +146,13 @@ export function Chats() {
           setSelectedSessionId(readySessions[0].id);
         }
       } catch (err) {
-        toast.error(t('chats.errors.loadSessions'), err instanceof Error ? err.message : undefined);
+        showErrorToast(t('chats.errors.loadSessions'), err instanceof Error ? err.message : undefined);
       } finally {
         setLoadingSessions(false);
       }
     };
     void loadSessions();
-  }, [t, toast]);
+  }, [t, showErrorToast]);
 
   // 2. Fetch chats when active session changes
   const loadChats = useCallback(
@@ -162,13 +164,13 @@ export function Chats() {
         const sorted = [...data].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
         setChats(sorted);
       } catch (err) {
-        toast.error(t('chats.errors.loadChats'), err instanceof Error ? err.message : undefined);
+        showErrorToast(t('chats.errors.loadChats'), err instanceof Error ? err.message : undefined);
         setChats([]);
       } finally {
         setLoadingChats(false);
       }
     },
-    [t, toast],
+    [t, showErrorToast],
   );
 
   useEffect(() => {
@@ -184,10 +186,10 @@ export function Chats() {
   const markChatRead = useCallback(
     (chatId: string) => {
       void sessionApi.markChatRead(selectedSessionId, chatId).catch(err => {
-        toast.warning(t('chats.errors.markRead'), err instanceof Error ? err.message : undefined);
+        showWarningToast(t('chats.errors.markRead'), err instanceof Error ? err.message : undefined);
       });
     },
-    [selectedSessionId, t, toast],
+    [selectedSessionId, t, showWarningToast],
   );
 
   // 3. WebSocket integration for real-time messages
@@ -333,16 +335,26 @@ export function Chats() {
       try {
         setLoadingMessages(true);
         markChatRead(chatId);
-        const data = await sessionApi.getChatMessages(selectedSessionId, chatId, 100);
-        setMessages([...data.messages].reverse());
+        // The DB holds only messages captured live since the gateway connected; the engine holds the
+        // real WhatsApp history (including messages from before connect). Merge both so a freshly
+        // paired session shows the conversation instead of an empty thread. Tolerate either side
+        // failing — only surface an error if both do.
+        const [dbRes, historyRes] = await Promise.allSettled([
+          sessionApi.getChatMessages(selectedSessionId, chatId, 100),
+          sessionApi.getChatHistory(selectedSessionId, chatId, 100, true),
+        ]);
+        if (dbRes.status === 'rejected' && historyRes.status === 'rejected') throw dbRes.reason;
+        const dbMessages = dbRes.status === 'fulfilled' ? dbRes.value.messages : [];
+        const history = historyRes.status === 'fulfilled' ? historyRes.value.map(mapEngineHistoryMessage) : [];
+        setMessages(mergeChatMessages(dbMessages, history));
       } catch (err) {
-        toast.error(t('chats.errors.loadMessages'), err instanceof Error ? err.message : undefined);
+        showErrorToast(t('chats.errors.loadMessages'), err instanceof Error ? err.message : undefined);
         setMessages([]);
       } finally {
         setLoadingMessages(false);
       }
     },
-    [selectedSessionId, markChatRead, t, toast],
+    [selectedSessionId, markChatRead, t, showErrorToast],
   );
 
   const handleReactMessage = async (msg: ChatMessageView, emoji: string) => {
@@ -385,7 +397,7 @@ export function Chats() {
         }),
       );
     } catch (err) {
-      toast.error(t('chats.errors.react'), err instanceof Error ? err.message : undefined);
+      showErrorToast(t('chats.errors.react'), err instanceof Error ? err.message : undefined);
     }
   };
 
@@ -411,7 +423,7 @@ export function Chats() {
         }),
       );
     } catch (err) {
-      toast.error(t('chats.errors.delete'), err instanceof Error ? err.message : undefined);
+      showErrorToast(t('chats.errors.delete'), err instanceof Error ? err.message : undefined);
     }
   };
 
@@ -572,7 +584,7 @@ export function Chats() {
         return updatedChats;
       });
     } catch (err) {
-      toast.error(t('chats.errors.send'), err instanceof Error ? err.message : undefined);
+      showErrorToast(t('chats.errors.send'), err instanceof Error ? err.message : undefined);
       setMessages(prev => prev.map(m => (m.id === tempId ? { ...m, status: 'failed' } : m)));
     } finally {
       setSending(false);
@@ -641,7 +653,7 @@ export function Chats() {
           </p>
         </div>
       ) : (
-        <div className="chats-layout">
+        <div className={`chats-layout ${activeChat ? 'has-active-chat' : ''}`}>
           {/* LEFT SIDEBAR: session & chat rooms */}
           <aside className="chats-sidebar">
             <div className="sidebar-header-box">
@@ -730,6 +742,9 @@ export function Chats() {
               <div className="room-container">
                 {/* Room header */}
                 <header className="room-header">
+                  <button className="room-back" onClick={() => setActiveChat(null)} aria-label={t('common.back')}>
+                    <ArrowLeft size={20} />
+                  </button>
                   <div className="room-avatar">
                     {activeChat.isGroup ? <Users size={20} /> : <User size={20} />}
                   </div>
