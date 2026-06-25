@@ -1,9 +1,5 @@
 # OpenWA AI companion — merged automatically with docker-compose.dev.yml.
 # Run: docker compose -f docker-compose.dev.yml -f docker-compose.override.yml up -d
-#
-# The ai-bot launches the Obsidian vector-RAG MCP server itself (as a stdio child,
-# see ai-bot/mcp-servers.json), so no separate MCP container is needed. Your Obsidian
-# vault is mounted read-only at /vault.
 services:
   # Limpia el lock de Chromium (SingletonLock) en cada arranque: tras un apagado abrupto queda
   # bloqueado el perfil y la sesión no reconecta. Entrypoint sigue siendo dumb-init.
@@ -26,8 +22,8 @@ services:
     volumes:
       # Editable at runtime (persona is read on each message) — no rebuild needed:
       - ./ai-bot/system-prompt.md:/app/system-prompt.md:ro
-      # Your knowledge base (Obsidian vault). Override the host path with VAULT_HOST_PATH.
-      - ${VAULT_HOST_PATH:-./data/vault}:/vault:ro
+      # Persistent conversation history (survives container restarts).
+      - ./data/ai-bot:/app/data
     depends_on:
       openwa:
         condition: service_healthy

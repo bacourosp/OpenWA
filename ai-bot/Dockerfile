@@ -1,8 +1,5 @@
 FROM node:22-alpine
 
-# git + build tools sometimes needed by npx-installed MCP servers
-RUN apk add --no-cache git
-
 WORKDIR /app
 
 COPY package*.json ./

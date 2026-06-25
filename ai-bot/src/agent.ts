@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { config } from './config.js';
-import { loadNotes, selectContext } from './vault.js';
+import { loadHistory, appendTurn } from './history.js';
 import { callLLM } from './llm.js';
 import { fetchNasPrice, formatQuote } from './market.js';
 
@@ -16,10 +16,6 @@ function loadSystemPrompt(): string {
 const MARKET_RE = /nasdaq|nas100|ustec|nq=?f|precio|cotiz|trading|análisis|analisis|bolsa|índice|indice|sp500|dow jones|vix|fed\b|fomc|mercado/i;
 function isMarketQuery(body: string): boolean { return MARKET_RE.test(body); }
 
-// In-memory conversation history per chat (last MAX_TURNS turns).
-const MAX_TURNS = 6;
-const chatHistory = new Map<string, Array<{ u: string; a: string }>>();
-
 export interface InboundContext {
   body: string;
   isGroup: boolean;
@@ -28,43 +24,36 @@ export interface InboundContext {
 }
 
 export async function generateReply(input: InboundContext): Promise<string> {
-  const notes = loadNotes();
-  const { context, used } = selectContext(notes, input.body);
-  console.log(`[rag] ${notes.length} notes; grounding: ${used.join(', ') || '(none)'}; providers: ${config.llmProviders.join('→')}`);
+  console.log(`[agent] ${input.chatId}${input.isGroup ? ' (grupo)' : ''} providers: ${config.llmProviders.join('→')}`);
+
+  const history = loadHistory(input.chatId);
+
+  const historyBlock = history.length > 0
+    ? [
+        '',
+        '=== HISTORIAL DE CONVERSACIÓN ===',
+        ...history.map((t) => `[Usuario] ${t.u}\n[Asistente] ${t.a}`),
+        '=== FIN HISTORIAL ===',
+        '',
+      ].join('\n')
+    : '';
 
   const systemInstruction = [
     loadSystemPrompt().trim(),
     '',
     '## Instrucciones de respuesta',
     '- Responde SIEMPRE en el idioma del usuario.',
-    '- Para conversación casual (saludos, charla) usa tu conocimiento general libremente.',
-    '- Para preguntas factuales (precios, estrategias, datos técnicos), prioriza la BASE DE CONOCIMIENTO.',
-    '- Si la base de conocimiento no tiene la respuesta, usa tu conocimiento general pero aclara que no tienes información específica actualizada.',
-    '- Nunca inventes datos concretos (precios, fechas exactas, políticas específicas) si no están en el vault.',
+    '- Usa el historial de conversación para dar respuestas coherentes y contextuales.',
+    '- Para conversación casual (saludos, charla) sé natural y amigable.',
+    '- Para preguntas factuales o técnicas, usa tu conocimiento general pero sé preciso.',
+    '- Nunca inventes datos concretos (precios, fechas exactas) que no tengas fundamentados.',
     '- Sé conciso y amigable para WhatsApp (2-5 líneas por defecto).',
-    '',
-    '=== BASE DE CONOCIMIENTO ===',
-    context || '(la base de conocimiento está vacía)',
-    '=== FIN BASE DE CONOCIMIENTO ===',
   ].join('\n');
-
-  // Build conversation history block for context
-  const history = chatHistory.get(input.chatId) ?? [];
-  const historyBlock = history.length > 0
-    ? [
-        '',
-        '=== CONVERSACIÓN PREVIA ===',
-        ...history.map((t) => `[Usuario] ${t.u}\n[Asistente] ${t.a}`),
-        '=== FIN CONVERSACIÓN ===',
-        '',
-      ].join('\n')
-    : '';
 
   const baseUserText = `${historyBlock}${input.senderName ? `[${input.senderName}] ` : ''}${input.body}`;
 
   let reply: string;
   if (isMarketQuery(input.body)) {
-    // Market query: fetch real-time price + use Gemini Search for today's news
     let priceBlock = '';
     try {
       const q = await fetchNasPrice();
@@ -88,8 +77,7 @@ export async function generateReply(input: InboundContext): Promise<string> {
     reply = await callLLM(systemInstruction, baseUserText, 1024);
   }
 
-  const turns = [...history, { u: input.body, a: reply }].slice(-MAX_TURNS);
-  chatHistory.set(input.chatId, turns);
+  appendTurn(input.chatId, input.body, reply);
 
   return reply;
 }

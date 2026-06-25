@@ -61,10 +61,9 @@ export const config = {
 
   systemPromptPath: env('SYSTEM_PROMPT_PATH', new URL('../system-prompt.md', import.meta.url).pathname),
 
-  // Knowledge base (Obsidian vault) + retrieval budget.
-  vaultDir: env('VAULT_DIR', '/vault'),
-  ragTopK: Number(env('RAG_TOP_K', '6')),
-  ragMaxChars: Number(env('RAG_MAX_CHARS', '120000')),
+  // Persistent conversation history (JSON files per chat).
+  historyDir: env('HISTORY_DIR', '/app/data/history'),
+  maxHistoryTurns: Number(env('MAX_HISTORY_TURNS', '30')),
 
   // Scheduler mode: test = every 5 min to TEST_GROUP_ID; production = time blocks to PRODUCTION_GROUPS.
   testMode: env('TEST_MODE', 'false') === 'true',

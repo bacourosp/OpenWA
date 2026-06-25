@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "obsidian-openwa": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "seekstone", "--vault", "/Users/pablo/Documents/GitHub/OpenWA/.obsidian-memory"]
-    }
-  }
-}
