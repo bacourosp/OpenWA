@@ -68,7 +68,7 @@ export function ConversationAnalysis() {
 
   useEffect(() => {
     sessionApi.list().then(list => {
-      const ready = list.filter(s => s.status === 'ready' || s.status === 'connected');
+      const ready = list.filter(s => s.status === 'ready');
       setSessions(ready);
       if (ready.length === 1) setSelectedSessionId(ready[0].id);
     }).catch(() => {});
